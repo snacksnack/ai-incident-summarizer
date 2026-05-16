@@ -1,0 +1,14 @@
+{
+  "rawPath": "/webhook/datadog",
+  "requestContext": {
+    "http": {
+      "method": "POST"
+    }
+  },
+  "headers": {
+    "content-type": "application/json",
+    "x-datadog-signature": "REPLACE_WITH_VALID_SIGNATURE"
+  },
+  "isBase64Encoded": false,
+  "body": "{\"id\":\"abc-123-def\",\"title\":\"Error rate above threshold\",\"msg\":\"Error rate for payments-service exceeded 5% over the last 5 minutes.\",\"priority\":\"P1\",\"alert_type\":\"error\",\"date_happened\":1705312200,\"org\":{\"id\":12345,\"name\":\"my-org\"},\"tags\":[\"service:payments-service\",\"env:production\",\"team:backend\"],\"url\":\"https://app.datadoghq.com/monitors/99999\",\"alert_transition\":\"Triggered\"}"
+}

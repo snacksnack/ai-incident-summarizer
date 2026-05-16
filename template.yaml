@@ -1,0 +1,76 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: AI-powered incident alert summarizer
+
+Parameters:
+  GithubWebhookSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for the GitHub webhook signing secret
+  DatadogWebhookSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for the Datadog webhook signing secret
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 29
+    MemorySize: 128
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: incident-summarizer
+
+Resources:
+
+  WebhookApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: prod
+      Description: Receives inbound webhooks from Datadog and GitHub Actions
+
+  WebhookReceiverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/webhook_receiver/
+      Handler: app.handler
+      Description: Validates HMAC signatures and forwards payloads to the normalizer
+      Environment:
+        Variables:
+          GITHUB_WEBHOOK_SECRET_ARN: !Ref GithubWebhookSecretArn
+          DATADOG_WEBHOOK_SECRET_ARN: !Ref DatadogWebhookSecretArn
+          NORMALIZER_FUNCTION_NAME: !Ref NormalizerFunction
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource:
+                - !Ref GithubWebhookSecretArn
+                - !Ref DatadogWebhookSecretArn
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt NormalizerFunction.Arn
+      Events:
+        GithubWebhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhookApi
+            Path: /webhook/github
+            Method: POST
+        DatadogWebhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhookApi
+            Path: /webhook/datadog
+            Method: POST
+
+  NormalizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/normalizer/
+      Handler: app.handler
+      Description: Normalises raw alert payloads to the shared incident schema (stub)
+
+Outputs:
+  WebhookApiUrl:
+    Description: Base URL for the webhook API endpoint
+    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com"

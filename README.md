@@ -68,6 +68,25 @@ EventBridge        API Gateway (HMAC validation)
 
 ---
 
+## Webhook endpoints
+
+After `sam deploy`, retrieve the base URL from the stack outputs:
+
+```bash
+aws cloudformation describe-stacks --stack-name <stack-name> \
+  --query "Stacks[0].Outputs[?OutputKey=='WebhookApiUrl'].OutputValue" \
+  --output text
+```
+
+| Source | Method | Path |
+|---|---|---|
+| GitHub Actions | POST | `<WebhookApiUrl>/webhook/github` |
+| Datadog | POST | `<WebhookApiUrl>/webhook/datadog` |
+
+CloudWatch alerts are delivered via EventBridge and do not use these endpoints.
+
+---
+
 ## Project structure
 
 ```
@@ -80,6 +99,9 @@ ai-incident-summarizer/
 │   ├── datadog.json
 │   └── github-actions.json
 ├── functions/
+│   ├── webhook_receiver/      # HMAC validation + downstream forwarding
+│   │   ├── app.py
+│   │   └── requirements.txt
 │   ├── normalizer/            # Alert normalizer Lambda
 │   │   ├── app.py
 │   │   └── requirements.txt
