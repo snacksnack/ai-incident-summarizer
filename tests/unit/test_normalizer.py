@@ -1,10 +1,13 @@
 import importlib
 import json
 import sys
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 # conftest.py adds layers/common/python to sys.path
+
+DEDUP_FUNCTION_NAME = "dedup-function"
 
 
 def _load():
@@ -18,8 +21,18 @@ def _load():
 
 
 @pytest.fixture()
-def normalizer():
-    return _load()
+def mock_lambda(monkeypatch):
+    monkeypatch.setenv("DEDUP_FUNCTION_NAME", DEDUP_FUNCTION_NAME)
+    mock = MagicMock()
+    with patch("boto3.client", return_value=mock):
+        yield mock
+
+
+@pytest.fixture()
+def normalizer(mock_lambda):
+    app = _load()
+    app._lambda_client = mock_lambda
+    return app
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -237,3 +250,20 @@ class TestUnknownSource:
     def test_missing_source_returns_none(self, normalizer):
         result = normalizer.handler({"data": "some payload"}, None)
         assert result is None
+
+
+# ── Dedup invocation ──────────────────────────────────────────────────────────
+
+class TestDedupInvocation:
+    def test_valid_alert_invokes_dedup_async(self, normalizer, mock_lambda):
+        normalizer.handler(_cw_event(), None)
+        mock_lambda.invoke.assert_called_once()
+        call_kwargs = mock_lambda.invoke.call_args[1]
+        assert call_kwargs["FunctionName"] == DEDUP_FUNCTION_NAME
+        assert call_kwargs["InvocationType"] == "Event"
+        payload = json.loads(call_kwargs["Payload"])
+        assert payload["source"] == "cloudwatch"
+
+    def test_unknown_source_does_not_invoke_dedup(self, normalizer, mock_lambda):
+        normalizer.handler({"source": "unknown"}, None)
+        mock_lambda.invoke.assert_not_called()

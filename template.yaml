@@ -86,6 +86,46 @@ Resources:
       Description: Normalises raw alert payloads to the shared incident schema
       Layers:
         - !Ref CommonLayer
+      Environment:
+        Variables:
+          DEDUP_FUNCTION_NAME: !Ref DedupFunction
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt DedupFunction.Arn
+
+  # ── Deduplication ───────────────────────────────────────────────────────────
+
+  DeduplicationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: fingerprint
+          AttributeType: S
+      KeySchema:
+        - AttributeName: fingerprint
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  DedupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/dedup/
+      Handler: app.handler
+      Description: Suppresses duplicate alerts within the correlation window
+      Layers:
+        - !Ref CommonLayer
+      Environment:
+        Variables:
+          DEDUP_TABLE_NAME: !Ref DeduplicationTable
+          CORRELATION_WINDOW_MINUTES: "5"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DeduplicationTable
 
   # ── CloudWatch → EventBridge path ──────────────────────────────────────────
 
