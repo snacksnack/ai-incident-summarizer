@@ -22,8 +22,11 @@ Built with AWS Lambda (Python), SAM, DynamoDB, and Claude / GPT-4o.
 CloudWatch          Datadog             GitHub Actions
     │                   │                     │
     ▼                   ▼                     ▼
-EventBridge        API Gateway (HMAC validation)
-    │                        │
+EventBridge        API Gateway
+    │                   │
+    │         Lambda webhook_receiver
+    │         (HMAC validation · 401/400/202)
+    │                   │
     └──────────┬─────────────┘
                ▼
         Lambda normalizer
