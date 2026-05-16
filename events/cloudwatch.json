@@ -1,0 +1,42 @@
+{
+  "version": "0",
+  "id": "c4c1c1c9-6542-e61b-6ef0-8c4d36933a92",
+  "source": "aws.cloudwatch",
+  "account": "123456789012",
+  "time": "2024-01-15T10:30:00Z",
+  "region": "us-east-1",
+  "detail-type": "CloudWatch Alarm State Change",
+  "detail": {
+    "alarmName": "payments-service-high-error-rate",
+    "state": {
+      "value": "ALARM",
+      "reason": "Threshold Crossed: 3 out of the last 3 datapoints were greater than the threshold (5.0).",
+      "reasonData": "{}",
+      "timestamp": "2024-01-15T10:30:00.341+0000"
+    },
+    "previousState": {
+      "value": "OK",
+      "reason": "Threshold Crossed",
+      "timestamp": "2024-01-15T10:25:00.479+0000"
+    },
+    "configuration": {
+      "description": "Fires when Lambda error rate exceeds 5% over 3 consecutive minutes",
+      "metrics": [
+        {
+          "id": "m1",
+          "metricStat": {
+            "metric": {
+              "namespace": "AWS/Lambda",
+              "name": "Errors",
+              "dimensions": {
+                "FunctionName": "payments-service"
+              }
+            },
+            "period": 60,
+            "stat": "Sum"
+          }
+        }
+      ]
+    }
+  }
+}
