@@ -1,10 +1,15 @@
 import json
 import logging
+import os
+
+import boto3
 
 from common.schema import NormalizedAlert
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+_lambda_client = boto3.client("lambda")
 
 _SEVERITY_KEYWORDS = ["critical", "high", "medium", "low"]
 
@@ -34,6 +39,13 @@ def handler(event: dict, context) -> dict | None:
         return None
 
     logger.info("Normalized alert: %s", json.dumps(alert.to_dict()))
+
+    _lambda_client.invoke(
+        FunctionName=os.environ["DEDUP_FUNCTION_NAME"],
+        InvocationType="Event",
+        Payload=json.dumps(alert.to_dict()),
+    )
+
     return alert.to_dict()
 
 
