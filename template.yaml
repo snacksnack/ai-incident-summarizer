@@ -70,7 +70,78 @@ Resources:
       Handler: app.handler
       Description: Normalises raw alert payloads to the shared incident schema (stub)
 
+  # ── CloudWatch → EventBridge path ──────────────────────────────────────────
+
+  NormalizerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  NormalizerDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref NormalizerDLQ
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt NormalizerDLQ.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt CloudWatchAlarmEventRule.Arn
+
+  CloudWatchAlarmEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Routes CloudWatch alarm state changes to the normalizer Lambda
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+      State: ENABLED
+      Targets:
+        - Id: NormalizerTarget
+          Arn: !GetAtt NormalizerFunction.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt NormalizerDLQ.Arn
+
+  NormalizerEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt NormalizerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CloudWatchAlarmEventRule.Arn
+
+  # ── Test alarm (trigger manually with set-alarm-state to verify the rule) ──
+
+  TestCloudWatchAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-test-alarm"
+      AlarmDescription: Test alarm for EventBridge rule verification (RC1-33)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NormalizerFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
 Outputs:
   WebhookApiUrl:
     Description: Base URL for the webhook API endpoint
     Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  NormalizerDLQUrl:
+    Description: SQS DLQ URL for failed EventBridge-to-normalizer deliveries
+    Value: !Ref NormalizerDLQ
