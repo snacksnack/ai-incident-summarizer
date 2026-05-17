@@ -52,22 +52,38 @@ EventBridge        API Gateway
 
 ### DynamoDB incident schema
 
-| Field | Description |
-|---|---|
-| `incident_id` (PK) | Unique incident identifier |
-| `source_alerts[]` | Raw alert payloads |
-| `affected_service` | Service name |
-| `severity` | critical / high / medium / low |
-| `status` | open / acknowledged / resolved |
-| `llm_summary` | LLM-generated summary |
-| `slack_thread_id` | Enables Slack reply threading |
-| `jira_ticket_id` | Linked Jira ticket |
-| `created_at` | ISO timestamp |
-| `ttl` | Auto-expires resolved incidents after 30 days |
+**Table: `IncidentTable`** — on-demand billing, TTL enabled on `ttl` attribute.
+
+| Field | Type | Description |
+|---|---|---|
+| `incident_id` | S — PK | UUID assigned when the incident window opens |
+| `source_alerts[]` | L | Alert summaries (`alert_id`, `source`, `alert_name`, `severity`, `status`, `received_at`) — no raw payloads |
+| `affected_service` | S | Service name; GSI partition key |
+| `severity` | S | `critical` / `high` / `medium` / `low` |
+| `status` | S — GSI PK | `open` / `acknowledged` / `resolved` |
+| `llm_summary` | S | LLM-generated incident summary |
+| `slack_thread_id` | S | Populated after Slack delivery; enables reply threading |
+| `jira_ticket_id` | S | Populated after Jira ticket creation |
+| `created_at` | S — GSI SK | ISO 8601 timestamp; sort key for both GSIs |
+| `ttl` | N | Unix epoch; resolved incidents expire after 30 days |
 
 **GSIs:**
-- `service-created-index` — query all incidents for a given service
-- `status-created-index` — query all open incidents
+
+| Index | PK | SK | Use case |
+|---|---|---|---|
+| `service-created-index` | `affected_service` | `created_at` | All incidents for a given service, newest first |
+| `status-created-index` | `status` | `created_at` | All open (or resolved/acknowledged) incidents, newest first |
+
+**Sample query — all open incidents for `payments-service`:**
+
+```python
+table.query(
+    IndexName="service-created-index",
+    KeyConditionExpression=Key("affected_service").eq("payments-service"),
+    FilterExpression=Attr("status").eq("open"),
+    ScanIndexForward=False,  # newest first
+)
+```
 
 ---
 
