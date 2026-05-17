@@ -95,7 +95,7 @@ Resources:
               Action: lambda:InvokeFunction
               Resource: !GetAtt DedupFunction.Arn
 
-  # ── Deduplication ───────────────────────────────────────────────────────────
+  # ── Deduplication + correlation ─────────────────────────────────────────────
 
   DeduplicationTable:
     Type: AWS::DynamoDB::Table
@@ -144,70 +144,44 @@ Resources:
         - DynamoDBCrudPolicy:
             TableName: !Ref CorrelationWindowTable
 
-  # ── CloudWatch → EventBridge path ──────────────────────────────────────────
+  # ── Incident store ───────────────────────────────────────────────────────────
 
-  NormalizerDLQ:
-    Type: AWS::SQS::Queue
+  IncidentTable:
+    Type: AWS::DynamoDB::Table
     Properties:
-      MessageRetentionPeriod: 1209600  # 14 days
-
-  NormalizerDLQPolicy:
-    Type: AWS::SQS::QueuePolicy
-    Properties:
-      Queues:
-        - !Ref NormalizerDLQ
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: events.amazonaws.com
-            Action: sqs:SendMessage
-            Resource: !GetAtt NormalizerDLQ.Arn
-            Condition:
-              ArnEquals:
-                aws:SourceArn: !GetAtt CloudWatchAlarmEventRule.Arn
-
-  CloudWatchAlarmEventRule:
-    Type: AWS::Events::Rule
-    Properties:
-      Description: Routes CloudWatch alarm state changes to the normalizer Lambda
-      EventPattern:
-        source:
-          - aws.cloudwatch
-        detail-type:
-          - CloudWatch Alarm State Change
-      State: ENABLED
-      Targets:
-        - Id: NormalizerTarget
-          Arn: !GetAtt NormalizerFunction.Arn
-          DeadLetterConfig:
-            Arn: !GetAtt NormalizerDLQ.Arn
-
-  NormalizerEventBridgePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !GetAtt NormalizerFunction.Arn
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt CloudWatchAlarmEventRule.Arn
-
-  TestCloudWatchAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${AWS::StackName}-test-alarm"
-      AlarmDescription: Test alarm for EventBridge rule verification (RC1-33)
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: !Ref NormalizerFunction
-      Statistic: Sum
-      Period: 60
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: incident_id
+          AttributeType: S
+        - AttributeName: affected_service
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: incident_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: service-created-index
+          KeySchema:
+            - AttributeName: affected_service
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-created-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
 
   # ── CloudWatch → EventBridge path ──────────────────────────────────────────
 
@@ -284,3 +258,7 @@ Outputs:
   NormalizerDLQUrl:
     Description: SQS DLQ URL for failed EventBridge-to-normalizer deliveries
     Value: !Ref NormalizerDLQ
+
+  IncidentTableName:
+    Description: DynamoDB incident table name
+    Value: !Ref IncidentTable
