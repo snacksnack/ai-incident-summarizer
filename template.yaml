@@ -111,21 +111,38 @@ Resources:
         AttributeName: ttl
         Enabled: true
 
+  CorrelationWindowTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: service_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: service_key
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
   DedupFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: functions/dedup/
       Handler: app.handler
-      Description: Suppresses duplicate alerts within the correlation window
+      Description: Suppresses duplicate alerts and groups related alerts into incidents
       Layers:
         - !Ref CommonLayer
       Environment:
         Variables:
           DEDUP_TABLE_NAME: !Ref DeduplicationTable
+          CORRELATION_TABLE_NAME: !Ref CorrelationWindowTable
           CORRELATION_WINDOW_MINUTES: "5"
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref DeduplicationTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CorrelationWindowTable
 
   # ── CloudWatch → EventBridge path ──────────────────────────────────────────
 

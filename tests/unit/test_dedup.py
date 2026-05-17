@@ -80,46 +80,72 @@ def _other_dynamo_error():
     return ClientError(error_response, "PutItem")
 
 
+CORRELATION_TABLE = "test-correlation-table"
+
+
 @pytest.fixture()
 def dedup(monkeypatch):
     monkeypatch.setenv("DEDUP_TABLE_NAME", DEDUP_TABLE)
+    monkeypatch.setenv("CORRELATION_TABLE_NAME", CORRELATION_TABLE)
     monkeypatch.setenv("CORRELATION_WINDOW_MINUTES", WINDOW_MINUTES)
-    mock_table = MagicMock()
-    with patch("boto3.resource") as mock_resource:
-        mock_resource.return_value.Table.return_value = mock_table
+    mock_dedup_table = MagicMock()
+    mock_window_table = MagicMock()
+    with patch("boto3.resource"):
         app = _load_dedup()
-        app._table = mock_table
-        yield app, mock_table
+        app._table = mock_dedup_table
+        app._window_table = mock_window_table
+        yield app, mock_dedup_table, mock_window_table
 
 
 class TestDedupHandler:
-    def test_first_occurrence_returns_alert(self, dedup):
-        app, mock_table = dedup
-        mock_table.put_item.return_value = {}
+    def _window_new_incident(self, mock_window_table):
+        """Configure the window table mock to simulate opening a new incident."""
+        mock_window_table.put_item.return_value = {}
+
+    def _window_existing_incident(self, mock_window_table, incident_id="existing-inc-123", count=2):
+        """Configure the window table mock to simulate an open window."""
+        mock_window_table.put_item.side_effect = _conditional_check_failed_error()
+        mock_window_table.update_item.return_value = {
+            "Attributes": {
+                "incident_id": incident_id,
+                "alert_count": count,
+                "service_key": ALERT["affected_service"],
+            }
+        }
+
+    def test_first_occurrence_returns_incident_envelope(self, dedup):
+        app, mock_dedup_table, mock_window_table = dedup
+        mock_dedup_table.put_item.return_value = {}
+        self._window_new_incident(mock_window_table)
         result = app.handler(ALERT, None)
-        assert result == ALERT
+        assert result is not None
+        assert result["alert"] == ALERT
+        assert result["is_new"] is True
+        assert result["alert_count"] == 1
+        assert "incident_id" in result
 
     def test_first_occurrence_calls_put_item(self, dedup):
-        app, mock_table = dedup
-        mock_table.put_item.return_value = {}
+        app, mock_dedup_table, mock_window_table = dedup
+        mock_dedup_table.put_item.return_value = {}
+        self._window_new_incident(mock_window_table)
         app.handler(ALERT, None)
-        mock_table.put_item.assert_called_once()
-        call_kwargs = mock_table.put_item.call_args[1]
+        mock_dedup_table.put_item.assert_called_once()
+        call_kwargs = mock_dedup_table.put_item.call_args[1]
         assert call_kwargs["Item"]["fingerprint"] == generate_fingerprint(
             ALERT["source"], ALERT["alert_name"], ALERT["affected_service"]
         )
         assert call_kwargs["ConditionExpression"] == "attribute_not_exists(fingerprint)"
 
     def test_duplicate_returns_none(self, dedup):
-        app, mock_table = dedup
-        mock_table.put_item.side_effect = _conditional_check_failed_error()
+        app, mock_dedup_table, mock_window_table = dedup
+        mock_dedup_table.put_item.side_effect = _conditional_check_failed_error()
         result = app.handler(ALERT, None)
         assert result is None
 
     def test_duplicate_logs_warning(self, dedup, caplog):
         import logging
-        app, mock_table = dedup
-        mock_table.put_item.side_effect = _conditional_check_failed_error()
+        app, mock_dedup_table, mock_window_table = dedup
+        mock_dedup_table.put_item.side_effect = _conditional_check_failed_error()
         with caplog.at_level(logging.WARNING):
             app.handler(ALERT, None)
         assert "Suppressing duplicate alert" in caplog.text
@@ -127,16 +153,76 @@ class TestDedupHandler:
         assert ALERT["alert_name"] in caplog.text
 
     def test_other_dynamo_error_propagates(self, dedup):
-        app, mock_table = dedup
-        mock_table.put_item.side_effect = _other_dynamo_error()
+        app, mock_dedup_table, mock_window_table = dedup
+        mock_dedup_table.put_item.side_effect = _other_dynamo_error()
         with pytest.raises(ClientError):
             app.handler(ALERT, None)
 
     def test_ttl_equals_now_plus_window(self, dedup):
-        app, mock_table = dedup
-        mock_table.put_item.return_value = {}
+        app, mock_dedup_table, mock_window_table = dedup
+        mock_dedup_table.put_item.return_value = {}
+        self._window_new_incident(mock_window_table)
         before = int(time.time()) + int(WINDOW_MINUTES) * 60
         app.handler(ALERT, None)
         after = int(time.time()) + int(WINDOW_MINUTES) * 60
-        written_ttl = mock_table.put_item.call_args[1]["Item"]["ttl"]
+        written_ttl = mock_dedup_table.put_item.call_args[1]["Item"]["ttl"]
         assert before <= written_ttl <= after
+
+
+# ── Window grouping tests ─────────────────────────────────────────────────────
+
+class TestWindowGrouping:
+    def test_new_service_opens_new_incident(self, dedup):
+        app, mock_dedup_table, mock_window_table = dedup
+        mock_dedup_table.put_item.return_value = {}
+        mock_window_table.put_item.return_value = {}
+        result = app.handler(ALERT, None)
+        assert result["is_new"] is True
+        assert result["alert_count"] == 1
+        assert "incident_id" in result
+
+    def test_second_alert_same_service_joins_existing_incident(self, dedup):
+        app, mock_dedup_table, mock_window_table = dedup
+        mock_dedup_table.put_item.return_value = {}
+        mock_window_table.put_item.side_effect = _conditional_check_failed_error()
+        mock_window_table.update_item.return_value = {
+            "Attributes": {
+                "incident_id": "existing-inc-456",
+                "alert_count": 2,
+                "service_key": ALERT["affected_service"],
+            }
+        }
+        result = app.handler(ALERT, None)
+        assert result["is_new"] is False
+        assert result["incident_id"] == "existing-inc-456"
+        assert result["alert_count"] == 2
+
+    def test_different_services_get_different_incident_ids(self, dedup):
+        app, mock_dedup_table, mock_window_table = dedup
+        mock_dedup_table.put_item.return_value = {}
+        mock_window_table.put_item.return_value = {}
+
+        result1 = app.handler(ALERT, None)
+        other_alert = {**ALERT, "affected_service": "checkout-service"}
+        result2 = app.handler(other_alert, None)
+
+        assert result1["incident_id"] != result2["incident_id"]
+
+    def test_window_table_put_stores_alert_summary_without_raw_payload(self, dedup):
+        app, mock_dedup_table, mock_window_table = dedup
+        mock_dedup_table.put_item.return_value = {}
+        mock_window_table.put_item.return_value = {}
+        app.handler(ALERT, None)
+        item = mock_window_table.put_item.call_args[1]["Item"]
+        assert "alert_summaries" in item
+        summary = item["alert_summaries"][0]
+        assert "raw_payload" not in summary
+        assert summary["alert_id"] == ALERT["alert_id"]
+        assert summary["source"] == ALERT["source"]
+
+    def test_window_table_error_propagates(self, dedup):
+        app, mock_dedup_table, mock_window_table = dedup
+        mock_dedup_table.put_item.return_value = {}
+        mock_window_table.put_item.side_effect = _other_dynamo_error()
+        with pytest.raises(ClientError):
+            app.handler(ALERT, None)
