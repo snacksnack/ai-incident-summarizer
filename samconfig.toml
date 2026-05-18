@@ -7,7 +7,10 @@ s3_prefix = "ai-incident-summarizer"
 region = "us-east-1"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
-parameter_overrides = "GithubWebhookSecretArn=\"arn:aws:secretsmanager:us-east-1:727323477998:secret:gh-webhook-secret-MOOKhC\" DatadogWebhookSecretArn=\"arn:aws:secretsmanager:us-east-1:727323477998:secret:dd-webhook-secret-IMmuhX\""
+parameter_overrides =
+  "GithubWebhookSecretArn=\"arn:aws:secretsmanager:us-east-1:727323477998:secret:gh-webhook-secret-MOOKhC\"
+  DatadogWebhookSecretArn=\"arn:aws:secretsmanager:us-east-1:727323477998:secret:dd-webhook-secret-IMmuhX\"
+  AnthropicApiKeySecretArn=\"arn:aws:secretsmanager:us-east-1:727323477998:secret:anthropic-api-key-EcJjQi\""
 image_repositories = []
 
 [default.global.parameters]
