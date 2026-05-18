@@ -22,11 +22,8 @@ Built with AWS Lambda (Python), SAM, DynamoDB, and Claude / GPT-4o.
 CloudWatch          Datadog             GitHub Actions
     │                   │                     │
     ▼                   ▼                     ▼
-EventBridge        API Gateway
-    │                   │
-    │         Lambda webhook_receiver
-    │         (HMAC validation · 401/400/202)
-    │                   │
+EventBridge        API Gateway (HMAC validation)
+    │                        │
     └──────────┬─────────────┘
                ▼
         Lambda normalizer
@@ -52,57 +49,22 @@ EventBridge        API Gateway
 
 ### DynamoDB incident schema
 
-**Table: `IncidentTable`** — on-demand billing, TTL enabled on `ttl` attribute.
-
-| Field | Type | Description |
-|---|---|---|
-| `incident_id` | S — PK | UUID assigned when the incident window opens |
-| `source_alerts[]` | L | Alert summaries (`alert_id`, `source`, `alert_name`, `severity`, `status`, `received_at`) — no raw payloads |
-| `affected_service` | S | Service name; GSI partition key |
-| `severity` | S | `critical` / `high` / `medium` / `low` |
-| `status` | S — GSI PK | `open` / `acknowledged` / `resolved` |
-| `llm_summary` | S | LLM-generated incident summary |
-| `slack_thread_id` | S | Populated after Slack delivery; enables reply threading |
-| `jira_ticket_id` | S | Populated after Jira ticket creation |
-| `created_at` | S — GSI SK | ISO 8601 timestamp; sort key for both GSIs |
-| `ttl` | N | Unix epoch; resolved incidents expire after 30 days |
+| Field | Description |
+|---|---|
+| `incident_id` (PK) | Unique incident identifier |
+| `source_alerts[]` | Raw alert payloads |
+| `affected_service` | Service name |
+| `severity` | critical / high / medium / low |
+| `status` | open / acknowledged / resolved |
+| `llm_summary` | LLM-generated summary |
+| `slack_thread_id` | Enables Slack reply threading |
+| `jira_ticket_id` | Linked Jira ticket |
+| `created_at` | ISO timestamp |
+| `ttl` | Auto-expires resolved incidents after 30 days |
 
 **GSIs:**
-
-| Index | PK | SK | Use case |
-|---|---|---|---|
-| `service-created-index` | `affected_service` | `created_at` | All incidents for a given service, newest first |
-| `status-created-index` | `status` | `created_at` | All open (or resolved/acknowledged) incidents, newest first |
-
-**Sample query — all open incidents for `payments-service`:**
-
-```python
-table.query(
-    IndexName="service-created-index",
-    KeyConditionExpression=Key("affected_service").eq("payments-service"),
-    FilterExpression=Attr("status").eq("open"),
-    ScanIndexForward=False,  # newest first
-)
-```
-
----
-
-## Webhook endpoints
-
-After `sam deploy`, retrieve the base URL from the stack outputs:
-
-```bash
-aws cloudformation describe-stacks --stack-name <stack-name> \
-  --query "Stacks[0].Outputs[?OutputKey=='WebhookApiUrl'].OutputValue" \
-  --output text
-```
-
-| Source | Method | Path |
-|---|---|---|
-| GitHub Actions | POST | `<WebhookApiUrl>/webhook/github` |
-| Datadog | POST | `<WebhookApiUrl>/webhook/datadog` |
-
-CloudWatch alerts are delivered via EventBridge and do not use these endpoints.
+- `service-created-index` — query all incidents for a given service
+- `status-created-index` — query all open incidents
 
 ---
 
@@ -118,9 +80,6 @@ ai-incident-summarizer/
 │   ├── datadog.json
 │   └── github-actions.json
 ├── functions/
-│   ├── webhook_receiver/      # HMAC validation + downstream forwarding
-│   │   ├── app.py
-│   │   └── requirements.txt
 │   ├── normalizer/            # Alert normalizer Lambda
 │   │   ├── app.py
 │   │   └── requirements.txt
@@ -191,6 +150,23 @@ sam deploy --guided
 
 ---
 
+## Webhook endpoints
+
+After `sam deploy`, retrieve the base URL from stack outputs:
+
+```bash
+aws cloudformation describe-stacks --stack-name ai-incident-summarizer \
+  --query "Stacks[0].Outputs[?OutputKey=='WebhookApiUrl'].OutputValue" \
+  --output text
+```
+
+| Source | Endpoint |
+|---|---|
+| GitHub Actions | `POST <WebhookApiUrl>/webhook/github` |
+| Datadog | `POST <WebhookApiUrl>/webhook/datadog` |
+
+---
+
 ## Key design decisions
 
 | Decision | Choice | Rationale |
@@ -200,6 +176,15 @@ sam deploy --guided
 | Secret management | AWS Secrets Manager | API keys never stored in plain text or env vars |
 | Deployment | AWS SAM | Native AWS tooling, infrastructure-as-code |
 | Observability | Datadog Lambda layer | APM traces, logs, and metrics auto-instrumented |
+
+---
+
+## Known limitations
+
+**Datadog webhook signature verification**
+Datadog's webhook integration does not support HMAC payload signing natively, unlike GitHub Actions which uses `X-Hub-Signature-256`. The Datadog endpoint validates that payloads are well-formed JSON but does not perform cryptographic signature verification. The endpoint URL is unguessable (random AWS API Gateway URL) which provides a baseline level of security.
+
+In a production system this would be addressed by adding a shared secret custom header (e.g. `X-Webhook-Secret`) in the Datadog webhook configuration and verifying it in the Lambda receiver.
 
 ---
 

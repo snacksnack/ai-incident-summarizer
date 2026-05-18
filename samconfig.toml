@@ -1,0 +1,14 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "ai-incident-summarizer"
+resolve_s3 = true
+s3_prefix = "ai-incident-summarizer"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "GithubWebhookSecretArn=\"arn:aws:secretsmanager:us-east-1:727323477998:secret:gh-webhook-secret-MOOKhC\" DatadogWebhookSecretArn=\"arn:aws:secretsmanager:us-east-1:727323477998:secret:dd-webhook-secret-IMmuhX\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"
