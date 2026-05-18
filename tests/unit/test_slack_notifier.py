@@ -47,11 +47,15 @@ def _slack_api_error(error_code: str = "channel_not_found"):
     return SlackApiError(message=error_code, response=response)
 
 
+JIRA_CREATOR_FUNCTION = "test-jira-creator"
+
+
 @pytest.fixture()
 def notifier(monkeypatch):
     monkeypatch.setenv("INCIDENT_TABLE_NAME", INCIDENT_TABLE)
     monkeypatch.setenv("SLACK_BOT_TOKEN_SECRET_ARN", SLACK_TOKEN_ARN)
     monkeypatch.setenv("SLACK_CHANNEL_ID", SLACK_CHANNEL)
+    monkeypatch.setenv("JIRA_CREATOR_FUNCTION_NAME", JIRA_CREATOR_FUNCTION)
 
     mock_table = MagicMock()
     mock_table.get_item.return_value = {"Item": INCIDENT}
@@ -60,10 +64,13 @@ def notifier(monkeypatch):
     mock_secrets = MagicMock()
     mock_secrets.get_secret_value.return_value = {"SecretString": SLACK_TOKEN}
 
+    mock_lambda_client = MagicMock()
+
     with patch("boto3.resource"), patch("boto3.client"):
         app = _load_slack_notifier()
         app._incident_table = mock_table
         app._secrets_client = mock_secrets
+        app._lambda_client = mock_lambda_client
         app._token_cache.clear()
         yield app, mock_table, mock_secrets
 

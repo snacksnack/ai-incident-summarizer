@@ -18,6 +18,18 @@ Parameters:
   SlackChannelId:
     Type: String
     Description: Slack channel ID to post incident alerts to
+  JiraApiTokenSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for the Jira API token
+  JiraBaseUrl:
+    Type: String
+    Description: Base URL for the Jira instance (e.g. https://your-org.atlassian.net)
+  JiraProjectKey:
+    Type: String
+    Description: Jira project key for new incident tickets (e.g. INC)
+  JiraUserEmail:
+    Type: String
+    Description: Email address associated with the Jira API token
 
 Globals:
   Function:
@@ -243,6 +255,7 @@ Resources:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
           SLACK_BOT_TOKEN_SECRET_ARN: !Ref SlackBotTokenSecretArn
           SLACK_CHANNEL_ID: !Ref SlackChannelId
+          JIRA_CREATOR_FUNCTION_NAME: !Ref JiraCreatorFunction
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref IncidentTable
@@ -250,6 +263,36 @@ Resources:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Ref SlackBotTokenSecretArn
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt JiraCreatorFunction.Arn
+
+  # ── Jira ticket creator ──────────────────────────────────────────────────────
+
+  JiraCreatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/jira_creator/
+      Handler: app.handler
+      Description: Creates Jira tickets for new incidents and writes the ticket ID back to DynamoDB
+      Layers:
+        - !Ref CommonLayer
+      Environment:
+        Variables:
+          INCIDENT_TABLE_NAME: !Ref IncidentTable
+          JIRA_API_TOKEN_SECRET_ARN: !Ref JiraApiTokenSecretArn
+          JIRA_BASE_URL: !Ref JiraBaseUrl
+          JIRA_PROJECT_KEY: !Ref JiraProjectKey
+          JIRA_USER_EMAIL: !Ref JiraUserEmail
+          SLACK_CHANNEL_ID: !Ref SlackChannelId
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref JiraApiTokenSecretArn
 
   # ── CloudWatch → EventBridge path ──────────────────────────────────────────
 
