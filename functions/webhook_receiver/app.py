@@ -30,8 +30,8 @@ def handler(event: dict, context) -> dict:
             return _response(401, {"error": "Unauthorized"})
     elif path == DATADOG_PATH:
         secret = _get_secret(os.environ["DATADOG_WEBHOOK_SECRET_ARN"])
-        sig_header = event.get("headers", {}).get("x-datadog-signature", "")
-        if not _verify_datadog(sig_header, body_bytes, secret):
+        header_value = event.get("headers", {}).get("x-webhook-secret", "")
+        if not _verify_datadog_header(header_value, secret):
             return _response(401, {"error": "Unauthorized"})
     else:
         return _response(404, {"error": "Not Found"})
@@ -78,14 +78,10 @@ def _verify_github(header_value: str, body_bytes: bytes, secret: str) -> bool:
     ).hexdigest()
     return hmac.compare_digest(expected, header_value)
 
-
-def _verify_datadog(header_value: str, body_bytes: bytes, secret: str) -> bool:
+def _verify_datadog_header(header_value: str, secret: str) -> bool:
     if not header_value:
         return False
-    expected = hmac.new(
-        secret.encode("utf-8"), body_bytes, hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected, header_value)
+    return hmac.compare_digest(secret, header_value)
 
 
 def _get_secret(arn: str) -> str:

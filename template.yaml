@@ -8,7 +8,7 @@ Parameters:
     Description: Secrets Manager ARN for the GitHub webhook signing secret
   DatadogWebhookSecretArn:
     Type: String
-    Description: Secrets Manager ARN for the Datadog webhook signing secret
+    Description: Secrets Manager ARN for the Datadog X-Webhook-Secret shared header value
 
 Globals:
   Function:
