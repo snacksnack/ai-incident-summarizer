@@ -9,6 +9,7 @@ INCIDENT_TABLE = "test-incident-table"
 API_KEY_SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:anthropic-key"
 API_KEY = "sk-ant-test-key"
 MODEL_ID = "claude-sonnet-4-6"
+SLACK_NOTIFIER_FUNCTION = "test-slack-notifier"
 
 INCIDENT = {
     "incident_id": "inc-123",
@@ -66,6 +67,7 @@ def summarizer(monkeypatch):
     monkeypatch.setenv("INCIDENT_TABLE_NAME", INCIDENT_TABLE)
     monkeypatch.setenv("ANTHROPIC_API_KEY_SECRET_ARN", API_KEY_SECRET_ARN)
     monkeypatch.setenv("MODEL_ID", MODEL_ID)
+    monkeypatch.setenv("SLACK_NOTIFIER_FUNCTION_NAME", SLACK_NOTIFIER_FUNCTION)
 
     mock_table = MagicMock()
     mock_table.get_item.return_value = {"Item": INCIDENT}
@@ -74,10 +76,13 @@ def summarizer(monkeypatch):
     mock_secrets = MagicMock()
     mock_secrets.get_secret_value.return_value = {"SecretString": API_KEY}
 
+    mock_lambda_client = MagicMock()
+
     with patch("boto3.resource"), patch("boto3.client"):
         app = _load_summarizer()
         app._incident_table = mock_table
         app._secrets_client = mock_secrets
+        app._lambda_client = mock_lambda_client
         app._api_key_cache.clear()
         yield app, mock_table, mock_secrets
 

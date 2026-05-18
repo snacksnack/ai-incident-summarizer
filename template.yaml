@@ -12,6 +12,12 @@ Parameters:
   AnthropicApiKeySecretArn:
     Type: String
     Description: Secrets Manager ARN for the Anthropic API key
+  SlackBotTokenSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for the Slack bot token
+  SlackChannelId:
+    Type: String
+    Description: Slack channel ID to post incident alerts to
 
 Globals:
   Function:
@@ -209,6 +215,7 @@ Resources:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
           ANTHROPIC_API_KEY_SECRET_ARN: !Ref AnthropicApiKeySecretArn
           MODEL_ID: claude-sonnet-4-6
+          SLACK_NOTIFIER_FUNCTION_NAME: !Ref SlackNotifierFunction
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref IncidentTable
@@ -216,6 +223,33 @@ Resources:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource: !Ref AnthropicApiKeySecretArn
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt SlackNotifierFunction.Arn
+
+  # ── Slack notifier ───────────────────────────────────────────────────────────
+
+  SlackNotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/slack_notifier/
+      Handler: app.handler
+      Description: Posts incident summaries to Slack and maintains thread continuity
+      Layers:
+        - !Ref CommonLayer
+      Environment:
+        Variables:
+          INCIDENT_TABLE_NAME: !Ref IncidentTable
+          SLACK_BOT_TOKEN_SECRET_ARN: !Ref SlackBotTokenSecretArn
+          SLACK_CHANNEL_ID: !Ref SlackChannelId
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref SlackBotTokenSecretArn
 
   # ── CloudWatch → EventBridge path ──────────────────────────────────────────
 
