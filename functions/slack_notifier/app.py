@@ -11,6 +11,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 _secrets_client = boto3.client("secretsmanager")
+_lambda_client = boto3.client("lambda")
 _dynamodb = boto3.resource("dynamodb")
 _incident_table = None
 _token_cache: dict[str, str] = {}
@@ -118,4 +119,12 @@ def handler(event: dict, context) -> dict | None:
         ExpressionAttributeValues={":ts": thread_ts},
     )
     logger.info("Opened new thread %s for incident %s", thread_ts, incident_id)
+
+    _lambda_client.invoke(
+        FunctionName=os.environ["JIRA_CREATOR_FUNCTION_NAME"],
+        InvocationType="Event",
+        Payload=json.dumps({"incident_id": incident_id}),
+    )
+    logger.info("Jira creator invoked for incident %s", incident_id)
+
     return {"incident_id": incident_id, "slack_thread_id": thread_ts}
