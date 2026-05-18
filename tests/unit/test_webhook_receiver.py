@@ -13,20 +13,10 @@ GITHUB_SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:github
 DATADOG_SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:datadog-webhook"
 NORMALIZER_FUNCTION_NAME = "normalizer-function"
 
-ENV = {
-    "GITHUB_WEBHOOK_SECRET_ARN": GITHUB_SECRET_ARN,
-    "DATADOG_WEBHOOK_SECRET_ARN": DATADOG_SECRET_ARN,
-    "NORMALIZER_FUNCTION_NAME": NORMALIZER_FUNCTION_NAME,
-}
-
 
 def _github_sig(body: str, secret: str = GITHUB_SECRET) -> str:
     digest = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
     return f"sha256={digest}"
-
-
-def _datadog_sig(body: str, secret: str = DATADOG_SECRET) -> str:
-    return hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
 
 
 def _make_event(path: str, body: str, headers: dict) -> dict:
@@ -133,20 +123,19 @@ class TestGithubWebhook:
 
 
 class TestDatadogWebhook:
-    def test_valid_signature_returns_202(self, mock_aws):
-        app, mock_lambda, _ = mock_aws
-        sig = _datadog_sig(DATADOG_BODY)
-        event = _make_event("/webhook/datadog", DATADOG_BODY, {"x-datadog-signature": sig})
+    def test_valid_secret_header_returns_202(self, mock_aws):
+        app, _, _ = mock_aws
+        event = _make_event("/webhook/datadog", DATADOG_BODY, {"x-webhook-secret": DATADOG_SECRET})
         response = app.handler(event, None)
         assert response["statusCode"] == 202
 
-    def test_invalid_signature_returns_401(self, mock_aws):
+    def test_wrong_secret_header_returns_401(self, mock_aws):
         app, _, _ = mock_aws
-        event = _make_event("/webhook/datadog", DATADOG_BODY, {"x-datadog-signature": "badhash"})
+        event = _make_event("/webhook/datadog", DATADOG_BODY, {"x-webhook-secret": "wrong-secret"})
         response = app.handler(event, None)
         assert response["statusCode"] == 401
 
-    def test_missing_signature_header_returns_401(self, mock_aws):
+    def test_missing_secret_header_returns_401(self, mock_aws):
         app, _, _ = mock_aws
         event = _make_event("/webhook/datadog", DATADOG_BODY, {})
         response = app.handler(event, None)
@@ -154,16 +143,13 @@ class TestDatadogWebhook:
 
     def test_malformed_json_returns_400(self, mock_aws):
         app, _, _ = mock_aws
-        bad_body = "{invalid"
-        sig = _datadog_sig(bad_body)
-        event = _make_event("/webhook/datadog", bad_body, {"x-datadog-signature": sig})
+        event = _make_event("/webhook/datadog", "{invalid", {"x-webhook-secret": DATADOG_SECRET})
         response = app.handler(event, None)
         assert response["statusCode"] == 400
 
     def test_forwards_envelope_to_normalizer(self, mock_aws):
         app, mock_lambda, _ = mock_aws
-        sig = _datadog_sig(DATADOG_BODY)
-        event = _make_event("/webhook/datadog", DATADOG_BODY, {"x-datadog-signature": sig})
+        event = _make_event("/webhook/datadog", DATADOG_BODY, {"x-webhook-secret": DATADOG_SECRET})
         app.handler(event, None)
         payload = json.loads(mock_lambda.invoke.call_args[1]["Payload"])
         assert payload["source"] == "datadog"
