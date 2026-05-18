@@ -15,6 +15,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 _dynamodb = boto3.resource("dynamodb")
+_lambda_client = boto3.client("lambda")
 _table = None
 _window_table = None
 _incident_table = None
@@ -196,4 +197,11 @@ def handler(event: dict, context) -> dict | None:
 
     grouping = _group_into_window(event, window_seconds)
     _persist_incident(event, grouping)
+
+    _lambda_client.invoke(
+        FunctionName=os.environ["SUMMARIZER_FUNCTION_NAME"],
+        InvocationType="Event",
+        Payload=json.dumps({"incident_id": grouping["incident_id"]}),
+    )
+
     return {"incident_id": grouping["incident_id"], "is_new": grouping["is_new"], "alert_count": grouping["alert_count"], "alert": event}

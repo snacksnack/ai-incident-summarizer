@@ -1,6 +1,7 @@
 import importlib
 import os
 import sys
+from unittest.mock import MagicMock
 
 import boto3
 import pytest
@@ -77,6 +78,7 @@ def dedup_app(dynamodb_tables, monkeypatch):
     monkeypatch.setenv("DEDUP_TABLE_NAME", DEDUP_TABLE)
     monkeypatch.setenv("CORRELATION_TABLE_NAME", CORRELATION_TABLE)
     monkeypatch.setenv("INCIDENT_TABLE_NAME", INCIDENT_TABLE)
+    monkeypatch.setenv("SUMMARIZER_FUNCTION_NAME", "integ-summarizer")
     monkeypatch.setenv("CORRELATION_WINDOW_MINUTES", "5")
 
     for mod in list(sys.modules):
@@ -90,5 +92,6 @@ def dedup_app(dynamodb_tables, monkeypatch):
     app._table = None
     app._window_table = None
     app._incident_table = None
+    app._lambda_client = MagicMock()
 
     yield app

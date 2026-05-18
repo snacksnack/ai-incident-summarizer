@@ -9,6 +9,9 @@ Parameters:
   DatadogWebhookSecretArn:
     Type: String
     Description: Secrets Manager ARN for the Datadog X-Webhook-Secret shared header value
+  AnthropicApiKeySecretArn:
+    Type: String
+    Description: Secrets Manager ARN for the Anthropic API key
 
 Globals:
   Function:
@@ -138,6 +141,7 @@ Resources:
           DEDUP_TABLE_NAME: !Ref DeduplicationTable
           CORRELATION_TABLE_NAME: !Ref CorrelationWindowTable
           INCIDENT_TABLE_NAME: !Ref IncidentTable
+          SUMMARIZER_FUNCTION_NAME: !Ref SummarizerFunction
           CORRELATION_WINDOW_MINUTES: "5"
       Policies:
         - DynamoDBCrudPolicy:
@@ -146,6 +150,10 @@ Resources:
             TableName: !Ref CorrelationWindowTable
         - DynamoDBCrudPolicy:
             TableName: !Ref IncidentTable
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt SummarizerFunction.Arn
 
   # ── Incident store ───────────────────────────────────────────────────────────
 
@@ -185,6 +193,29 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
+
+  # ── LLM summarizer ──────────────────────────────────────────────────────────
+
+  SummarizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/summarizer/
+      Handler: app.handler
+      Description: Summarizes grouped incidents using Claude via the Anthropic API
+      Layers:
+        - !Ref CommonLayer
+      Environment:
+        Variables:
+          INCIDENT_TABLE_NAME: !Ref IncidentTable
+          ANTHROPIC_API_KEY_SECRET_ARN: !Ref AnthropicApiKeySecretArn
+          MODEL_ID: claude-sonnet-4-6
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref AnthropicApiKeySecretArn
 
   # ── CloudWatch → EventBridge path ──────────────────────────────────────────
 
