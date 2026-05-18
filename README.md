@@ -176,15 +176,14 @@ aws cloudformation describe-stacks --stack-name ai-incident-summarizer \
 | Secret management | AWS Secrets Manager | API keys never stored in plain text or env vars |
 | Deployment | AWS SAM | Native AWS tooling, infrastructure-as-code |
 | Observability | Datadog Lambda layer | APM traces, logs, and metrics auto-instrumented |
+| Incident history UI | Next.js on Vercel | Next.js API routes call DynamoDB directly as Vercel serverless functions — no API Gateway needed. A single `vercel deploy` produces a shareable URL. React handles the dashboard UI. Chosen over a static S3 + API Gateway approach for simplicity and to gain practical exposure to Vercel, which is widely used in the industry. |
 
 ---
 
 ## Known limitations
 
 **Datadog webhook signature verification**
-Datadog's webhook integration does not support HMAC payload signing natively, unlike GitHub Actions which uses `X-Hub-Signature-256`. The Datadog endpoint validates that payloads are well-formed JSON but does not perform cryptographic signature verification. The endpoint URL is unguessable (random AWS API Gateway URL) which provides a baseline level of security.
-
-In a production system this would be addressed by adding a shared secret custom header (e.g. `X-Webhook-Secret`) in the Datadog webhook configuration and verifying it in the Lambda receiver.
+Datadog's webhook integration does not support HMAC payload signing natively, unlike GitHub Actions which uses `X-Hub-Signature-256`. Instead, a shared secret is passed via a custom `X-Webhook-Secret` header configured in the Datadog webhook settings and stored in AWS Secrets Manager. The receiver validates the header value using a timing-safe comparison. This is Datadog's recommended approach for webhook authentication.
 
 ---
 
