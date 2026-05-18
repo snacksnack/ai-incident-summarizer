@@ -9,6 +9,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 _secrets_client = boto3.client("secretsmanager")
+_lambda_client = boto3.client("lambda")
 _dynamodb = boto3.resource("dynamodb")
 _incident_table = None
 _api_key_cache: dict[str, str] = {}
@@ -101,5 +102,12 @@ def handler(event: dict, context) -> dict | None:
         ExpressionAttributeValues={":s": llm_summary},
     )
     logger.info("llm_summary written to DynamoDB for incident %s", incident_id)
+
+    _lambda_client.invoke(
+        FunctionName=os.environ["SLACK_NOTIFIER_FUNCTION_NAME"],
+        InvocationType="Event",
+        Payload=json.dumps({"incident_id": incident_id}),
+    )
+    logger.info("Slack notifier invoked for incident %s", incident_id)
 
     return {"incident_id": incident_id, "llm_summary": llm_summary}
