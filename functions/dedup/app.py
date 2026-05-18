@@ -17,6 +17,7 @@ logger.setLevel(logging.INFO)
 _dynamodb = boto3.resource("dynamodb")
 _table = None
 _window_table = None
+_incident_table = None
 
 
 def _get_table():
@@ -31,6 +32,13 @@ def _get_window_table():
     if _window_table is None:
         _window_table = _dynamodb.Table(os.environ["CORRELATION_TABLE_NAME"])
     return _window_table
+
+
+def _get_incident_table():
+    global _incident_table
+    if _incident_table is None:
+        _incident_table = _dynamodb.Table(os.environ["INCIDENT_TABLE_NAME"])
+    return _incident_table
 
 
 def _alert_summary(event: dict) -> dict:
@@ -107,6 +115,45 @@ def _group_into_window(event: dict, window_seconds: int) -> dict:
     }
 
 
+def _persist_incident(event: dict, grouping: dict) -> None:
+    incident_id = grouping["incident_id"]
+    summary = _alert_summary(event)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    if grouping["is_new"]:
+        try:
+            _get_incident_table().put_item(
+                Item={
+                    "incident_id": incident_id,
+                    "affected_service": event["affected_service"],
+                    "severity": event["severity"],
+                    "status": "open",
+                    "source_alerts": [summary],
+                    "created_at": now_iso,
+                },
+                ConditionExpression="attribute_not_exists(incident_id)",
+            )
+            logger.info("Persisted new incident: incident_id=%s", incident_id)
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                logger.info("Incident %s already exists, skipping duplicate write", incident_id)
+            else:
+                raise
+    else:
+        _get_incident_table().update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression=(
+                "SET source_alerts = list_append(source_alerts, :s), "
+                "last_updated_at = :ts"
+            ),
+            ExpressionAttributeValues={
+                ":s": [summary],
+                ":ts": now_iso,
+            },
+        )
+        logger.info("Updated incident: incident_id=%s alert_count=%s", incident_id, grouping["alert_count"])
+
+
 def handler(event: dict, context) -> dict | None:
     fingerprint = generate_fingerprint(
         source=event["source"],
@@ -148,4 +195,5 @@ def handler(event: dict, context) -> dict | None:
     )
 
     grouping = _group_into_window(event, window_seconds)
+    _persist_incident(event, grouping)
     return {"incident_id": grouping["incident_id"], "is_new": grouping["is_new"], "alert_count": grouping["alert_count"], "alert": event}

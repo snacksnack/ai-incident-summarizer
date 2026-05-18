@@ -8,6 +8,7 @@ from moto import mock_aws
 
 DEDUP_TABLE = "integ-dedup-table"
 CORRELATION_TABLE = "integ-correlation-table"
+INCIDENT_TABLE = "integ-incident-table"
 
 
 @pytest.fixture()
@@ -38,13 +39,44 @@ def dynamodb_tables(aws_credentials):
             BillingMode="PAY_PER_REQUEST",
         )
 
-        yield dedup_table, window_table
+        incident_table = dynamodb.create_table(
+            TableName=INCIDENT_TABLE,
+            KeySchema=[{"AttributeName": "incident_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[
+                {"AttributeName": "incident_id", "AttributeType": "S"},
+                {"AttributeName": "affected_service", "AttributeType": "S"},
+                {"AttributeName": "status", "AttributeType": "S"},
+                {"AttributeName": "created_at", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "service-created-index",
+                    "KeySchema": [
+                        {"AttributeName": "affected_service", "KeyType": "HASH"},
+                        {"AttributeName": "created_at", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+                {
+                    "IndexName": "status-created-index",
+                    "KeySchema": [
+                        {"AttributeName": "status", "KeyType": "HASH"},
+                        {"AttributeName": "created_at", "KeyType": "RANGE"},
+                    ],
+                    "Projection": {"ProjectionType": "ALL"},
+                },
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+
+        yield dedup_table, window_table, incident_table
 
 
 @pytest.fixture()
 def dedup_app(dynamodb_tables, monkeypatch):
     monkeypatch.setenv("DEDUP_TABLE_NAME", DEDUP_TABLE)
     monkeypatch.setenv("CORRELATION_TABLE_NAME", CORRELATION_TABLE)
+    monkeypatch.setenv("INCIDENT_TABLE_NAME", INCIDENT_TABLE)
     monkeypatch.setenv("CORRELATION_WINDOW_MINUTES", "5")
 
     for mod in list(sys.modules):
@@ -55,8 +87,8 @@ def dedup_app(dynamodb_tables, monkeypatch):
     import app
     importlib.reload(app)
 
-    # Reset module-level table caches so they bind to moto tables
     app._table = None
     app._window_table = None
+    app._incident_table = None
 
     yield app

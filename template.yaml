@@ -137,12 +137,15 @@ Resources:
         Variables:
           DEDUP_TABLE_NAME: !Ref DeduplicationTable
           CORRELATION_TABLE_NAME: !Ref CorrelationWindowTable
+          INCIDENT_TABLE_NAME: !Ref IncidentTable
           CORRELATION_WINDOW_MINUTES: "5"
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref DeduplicationTable
         - DynamoDBCrudPolicy:
             TableName: !Ref CorrelationWindowTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentTable
 
   # ── Incident store ───────────────────────────────────────────────────────────
 

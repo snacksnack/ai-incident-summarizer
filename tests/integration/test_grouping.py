@@ -1,7 +1,11 @@
 import time
 from unittest.mock import patch
 
+import boto3
 import pytest
+from moto import mock_aws
+
+from tests.integration.conftest import INCIDENT_TABLE
 
 
 def _make_alert(service, source="cloudwatch", alert_name="cpu-alarm", n=0):
@@ -38,6 +42,34 @@ class TestServiceIsolation:
         assert result_a["incident_id"] != result_b["incident_id"]
         assert result_a["is_new"] is True
         assert result_b["is_new"] is True
+
+
+class TestPersistence:
+    def test_new_incident_written_to_dynamodb_with_status_open(self, dedup_app, dynamodb_tables):
+        _, _, incident_table = dynamodb_tables
+        result = dedup_app.handler(_make_alert("payments-service"), None)
+        item = incident_table.get_item(Key={"incident_id": result["incident_id"]})["Item"]
+        assert item["status"] == "open"
+        assert item["affected_service"] == "payments-service"
+        assert len(item["source_alerts"]) == 1
+
+    def test_second_alert_appends_to_source_alerts(self, dedup_app, dynamodb_tables):
+        _, _, incident_table = dynamodb_tables
+        alert1 = _make_alert("payments-service", alert_name="alarm-1", n=0)
+        alert2 = _make_alert("payments-service", alert_name="alarm-2", n=1)
+        result1 = dedup_app.handler(alert1, None)
+        dedup_app.handler(alert2, None)
+        item = incident_table.get_item(Key={"incident_id": result1["incident_id"]})["Item"]
+        assert len(item["source_alerts"]) == 2
+
+    def test_idempotent_write_does_not_duplicate_incident(self, dedup_app, dynamodb_tables):
+        _, _, incident_table = dynamodb_tables
+        alert = _make_alert("payments-service")
+        result = dedup_app.handler(alert, None)
+        # Manually call _persist_incident again with is_new=True to simulate a race
+        dedup_app._persist_incident(alert, {"incident_id": result["incident_id"], "is_new": True})
+        item = incident_table.get_item(Key={"incident_id": result["incident_id"]})["Item"]
+        assert len(item["source_alerts"]) == 1  # still only one
 
 
 class TestWindowExpiry:
