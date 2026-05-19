@@ -30,15 +30,31 @@ Parameters:
   JiraUserEmail:
     Type: String
     Description: Email address associated with the Jira API token
+  DatadogApiKeySecretArn:
+    Type: String
+    Description: Secrets Manager ARN for the Datadog API key
+  DatadogEnv:
+    Type: String
+    Description: Deployment environment for Datadog tagging (dev / staging / prod)
+    Default: dev
 
 Globals:
   Function:
     Runtime: python3.11
     Timeout: 29
     MemorySize: 128
+    Handler: datadog_lambda.handler.handler
     Environment:
       Variables:
         POWERTOOLS_SERVICE_NAME: incident-summarizer
+        DD_LAMBDA_HANDLER: app.handler
+        DD_API_KEY_SECRET_ARN: !Ref DatadogApiKeySecretArn
+        DD_SITE: datadoghq.com
+        DD_ENV: !Ref DatadogEnv
+        DD_TRACE_ENABLED: "true"
+        DD_SERVERLESS_LOGS_ENABLED: "true"
+        DD_CAPTURE_LAMBDA_PAYLOAD: "false"
+        DD_FLUSH_TO_LOG: "false"
 
 Resources:
 
@@ -65,8 +81,10 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: functions/webhook_receiver/
-      Handler: app.handler
       Description: Validates HMAC signatures and forwards payloads to the normalizer
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
       Environment:
         Variables:
           GITHUB_WEBHOOK_SECRET_ARN: !Ref GithubWebhookSecretArn
@@ -79,6 +97,7 @@ Resources:
               Resource:
                 - !Ref GithubWebhookSecretArn
                 - !Ref DatadogWebhookSecretArn
+                - !Ref DatadogApiKeySecretArn
         - Statement:
             - Effect: Allow
               Action: lambda:InvokeFunction
@@ -103,14 +122,19 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: functions/normalizer/
-      Handler: app.handler
       Description: Normalises raw alert payloads to the shared incident schema
       Layers:
         - !Ref CommonLayer
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
       Environment:
         Variables:
           DEDUP_FUNCTION_NAME: !Ref DedupFunction
       Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref DatadogApiKeySecretArn
         - Statement:
             - Effect: Allow
               Action: lambda:InvokeFunction
@@ -150,10 +174,11 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: functions/dedup/
-      Handler: app.handler
       Description: Suppresses duplicate alerts and groups related alerts into incidents
       Layers:
         - !Ref CommonLayer
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
       Environment:
         Variables:
           DEDUP_TABLE_NAME: !Ref DeduplicationTable
@@ -168,6 +193,10 @@ Resources:
             TableName: !Ref CorrelationWindowTable
         - DynamoDBCrudPolicy:
             TableName: !Ref IncidentTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref DatadogApiKeySecretArn
         - Statement:
             - Effect: Allow
               Action: lambda:InvokeFunction
@@ -218,10 +247,11 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: functions/summarizer/
-      Handler: app.handler
       Description: Summarizes grouped incidents using Claude via the Anthropic API
       Layers:
         - !Ref CommonLayer
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
@@ -234,7 +264,9 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
-              Resource: !Ref AnthropicApiKeySecretArn
+              Resource:
+                - !Ref AnthropicApiKeySecretArn
+                - !Ref DatadogApiKeySecretArn
         - Statement:
             - Effect: Allow
               Action: lambda:InvokeFunction
@@ -246,10 +278,11 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: functions/slack_notifier/
-      Handler: app.handler
       Description: Posts incident summaries to Slack and maintains thread continuity
       Layers:
         - !Ref CommonLayer
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
@@ -262,7 +295,9 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
-              Resource: !Ref SlackBotTokenSecretArn
+              Resource:
+                - !Ref SlackBotTokenSecretArn
+                - !Ref DatadogApiKeySecretArn
         - Statement:
             - Effect: Allow
               Action: lambda:InvokeFunction
@@ -274,10 +309,11 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: functions/jira_creator/
-      Handler: app.handler
       Description: Creates Jira tickets for new incidents and writes the ticket ID back to DynamoDB
       Layers:
         - !Ref CommonLayer
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
@@ -292,7 +328,9 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
-              Resource: !Ref JiraApiTokenSecretArn
+              Resource:
+                - !Ref JiraApiTokenSecretArn
+                - !Ref DatadogApiKeySecretArn
 
   # ── CloudWatch → EventBridge path ──────────────────────────────────────────
 
