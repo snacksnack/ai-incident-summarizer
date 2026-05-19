@@ -2,7 +2,9 @@
 
 An AI-powered incident summarization system that ingests alerts from multiple observability sources, deduplicates and correlates them, summarizes incidents using an LLM, and delivers operational summaries to Slack and Jira.
 
-Built with AWS Lambda (Python), SAM, DynamoDB, and Claude / GPT-4o.
+Built with AWS Lambda (Python), SAM, DynamoDB, Claude, Next.js, and Vercel.
+
+**Live dashboard:** [ai-incident-summarizer.vercel.app](https://ai-incident-summarizer.vercel.app)
 
 ---
 
