@@ -150,6 +150,28 @@ sam deploy --guided
 
 ---
 
+## Seeding the incident dashboard
+
+To populate the incident history UI with realistic demo data:
+
+```bash
+pip install boto3
+
+DYNAMODB_TABLE=<table-name> AWS_DEFAULT_REGION=us-east-1 python scripts/seed_dynamo.py
+```
+
+Get the table name from the stack outputs:
+
+```bash
+aws cloudformation describe-stacks --stack-name ai-incident-summarizer \
+  --query "Stacks[0].Outputs[?OutputKey=='IncidentTableName'].OutputValue" \
+  --output text
+```
+
+The script seeds 90 incidents across 10 services (payments, auth, API gateway, notifications, search, billing, users, CDN, data pipeline, WebSocket) with a mix of open, resolved, and acknowledged statuses. Re-running the script is safe — it upserts by `incident_id` and does not create duplicates.
+
+---
+
 ## Webhook endpoints
 
 After `sam deploy`, retrieve the base URL from stack outputs:
