@@ -43,3 +43,22 @@ jobs:
 
       - name: SAM deploy
         run: sam deploy --no-confirm-changeset --no-fail-on-empty-changeset
+
+  deploy-frontend:
+    runs-on: ubuntu-latest
+    needs: test-and-deploy
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Deploy frontend to Vercel
+        working-directory: frontend
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: npx vercel@latest --prod --token "$VERCEL_TOKEN"
