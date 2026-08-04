@@ -13,6 +13,12 @@ export interface LlmSummary {
   next_step: string;
 }
 
+export interface Service {
+  affected_service: string;
+  first_seen_at?: string;
+  last_seen_at?: string;
+}
+
 export interface Incident {
   incident_id: string;
   affected_service: string;

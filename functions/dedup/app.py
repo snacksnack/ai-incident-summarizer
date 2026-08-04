@@ -19,6 +19,7 @@ _lambda_client = boto3.client("lambda")
 _table = None
 _window_table = None
 _incident_table = None
+_service_registry_table = None
 
 
 def _get_table():
@@ -40,6 +41,43 @@ def _get_incident_table():
     if _incident_table is None:
         _incident_table = _dynamodb.Table(os.environ["INCIDENT_TABLE_NAME"])
     return _incident_table
+
+
+def _get_service_registry_table():
+    global _service_registry_table
+    if _service_registry_table is None:
+        _service_registry_table = _dynamodb.Table(os.environ["SERVICE_REGISTRY_TABLE_NAME"])
+    return _service_registry_table
+
+
+def _register_service(affected_service: str, now_iso: str) -> None:
+    """Record that this service has opened an incident.
+
+    Feeds the dashboard's service filters, which would otherwise have to scan the
+    incident table. The write is an idempotent upsert — safe to replay, and
+    self-healing, since the next incident for the service retries it.
+
+    Failures are logged and swallowed on purpose. The registry is derived data;
+    losing an incident because a derived write failed would be a far worse
+    outcome than a service missing from the filter list for one incident.
+    """
+    try:
+        _get_service_registry_table().update_item(
+            Key={"affected_service": affected_service},
+            UpdateExpression=(
+                "SET last_seen_at = :ts, "
+                "first_seen_at = if_not_exists(first_seen_at, :ts)"
+            ),
+            ExpressionAttributeValues={":ts": now_iso},
+        )
+        logger.info("Registered service in registry: affected_service=%s", affected_service)
+    except Exception:
+        logger.warning(
+            "Service registry write failed for affected_service=%s — "
+            "incident is unaffected, registry self-heals on the next incident",
+            affected_service,
+            exc_info=True,
+        )
 
 
 def _alert_summary(event: dict) -> dict:
@@ -135,6 +173,7 @@ def _persist_incident(event: dict, grouping: dict) -> None:
                 ConditionExpression="attribute_not_exists(incident_id)",
             )
             logger.info("Persisted new incident: incident_id=%s", incident_id)
+            _register_service(event["affected_service"], now_iso)
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 logger.info("Incident %s already exists, skipping duplicate write", incident_id)

@@ -83,6 +83,7 @@ def _other_dynamo_error():
 
 CORRELATION_TABLE = "test-correlation-table"
 INCIDENT_TABLE = "test-incident-table"
+SERVICE_REGISTRY_TABLE = "test-service-registry-table"
 SUMMARIZER_FUNCTION = "test-summarizer"
 
 
@@ -91,6 +92,7 @@ def dedup(monkeypatch):
     monkeypatch.setenv("DEDUP_TABLE_NAME", DEDUP_TABLE)
     monkeypatch.setenv("CORRELATION_TABLE_NAME", CORRELATION_TABLE)
     monkeypatch.setenv("INCIDENT_TABLE_NAME", INCIDENT_TABLE)
+    monkeypatch.setenv("SERVICE_REGISTRY_TABLE_NAME", SERVICE_REGISTRY_TABLE)
     monkeypatch.setenv("SUMMARIZER_FUNCTION_NAME", SUMMARIZER_FUNCTION)
     monkeypatch.setenv("CORRELATION_WINDOW_MINUTES", WINDOW_MINUTES)
     mock_dedup_table = MagicMock()
@@ -102,6 +104,9 @@ def dedup(monkeypatch):
         app._table = mock_dedup_table
         app._window_table = mock_window_table
         app._incident_table = mock_incident_table
+        # Reached via app._service_registry_table rather than the fixture tuple,
+        # to keep the existing unpackings in this file unchanged.
+        app._service_registry_table = MagicMock()
         app._lambda_client = mock_lambda_client
         yield app, mock_dedup_table, mock_window_table, mock_incident_table, mock_lambda_client
 
@@ -286,6 +291,83 @@ class TestIncidentPersistence:
         mock_incident_table.put_item.side_effect = _other_dynamo_error()
         with pytest.raises(ClientError):
             app.handler(ALERT, None)
+
+
+# ── Service registry tests ────────────────────────────────────────────────────
+
+class TestServiceRegistry:
+    def _setup_new_incident(self, mock_dedup_table, mock_window_table, mock_incident_table):
+        mock_dedup_table.put_item.return_value = {}
+        mock_window_table.put_item.return_value = {}
+        mock_incident_table.put_item.return_value = {}
+
+    def test_new_incident_registers_service(self, dedup):
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
+        self._setup_new_incident(mock_dedup_table, mock_window_table, mock_incident_table)
+        app.handler(ALERT, None)
+        registry = app._service_registry_table
+        registry.update_item.assert_called_once()
+        call_kwargs = registry.update_item.call_args[1]
+        assert call_kwargs["Key"] == {"affected_service": ALERT["affected_service"]}
+
+    def test_registry_write_sets_last_seen_and_preserves_first_seen(self, dedup):
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
+        self._setup_new_incident(mock_dedup_table, mock_window_table, mock_incident_table)
+        app.handler(ALERT, None)
+        call_kwargs = app._service_registry_table.update_item.call_args[1]
+        expression = call_kwargs["UpdateExpression"]
+        assert "last_seen_at = :ts" in expression
+        assert "first_seen_at = if_not_exists(first_seen_at, :ts)" in expression
+        assert set(call_kwargs["ExpressionAttributeValues"]) == {":ts"}
+
+    def test_existing_incident_does_not_register(self, dedup):
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
+        mock_dedup_table.put_item.return_value = {}
+        mock_window_table.put_item.side_effect = _conditional_check_failed_error()
+        mock_window_table.update_item.return_value = {
+            "Attributes": {"incident_id": "inc-123", "alert_count": 2, "service_key": ALERT["affected_service"]}
+        }
+        mock_incident_table.update_item.return_value = {}
+        app.handler(ALERT, None)
+        app._service_registry_table.update_item.assert_not_called()
+
+    def test_duplicate_incident_write_does_not_register(self, dedup):
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
+        mock_dedup_table.put_item.return_value = {}
+        mock_window_table.put_item.return_value = {}
+        mock_incident_table.put_item.side_effect = _conditional_check_failed_error()
+        app.handler(ALERT, None)
+        app._service_registry_table.update_item.assert_not_called()
+
+    def test_registry_failure_does_not_break_incident_flow(self, dedup):
+        app, mock_dedup_table, mock_window_table, mock_incident_table, mock_lambda_client = dedup
+        self._setup_new_incident(mock_dedup_table, mock_window_table, mock_incident_table)
+        app._service_registry_table.update_item.side_effect = _other_dynamo_error()
+        result = app.handler(ALERT, None)
+        assert result is not None
+        assert result["is_new"] is True
+        mock_incident_table.put_item.assert_called_once()
+        mock_lambda_client.invoke.assert_called_once()
+
+    def test_registry_failure_logs_warning(self, dedup, caplog):
+        import logging
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
+        self._setup_new_incident(mock_dedup_table, mock_window_table, mock_incident_table)
+        app._service_registry_table.update_item.side_effect = _other_dynamo_error()
+        with caplog.at_level(logging.WARNING):
+            app.handler(ALERT, None)
+        assert "Service registry write failed" in caplog.text
+        assert ALERT["affected_service"] in caplog.text
+
+    def test_missing_registry_table_env_var_does_not_break_incident_flow(self, dedup, monkeypatch):
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
+        self._setup_new_incident(mock_dedup_table, mock_window_table, mock_incident_table)
+        # Simulate the window between deploying the function and the table existing.
+        app._service_registry_table = None
+        monkeypatch.delenv("SERVICE_REGISTRY_TABLE_NAME", raising=False)
+        result = app.handler(ALERT, None)
+        assert result is not None
+        mock_incident_table.put_item.assert_called_once()
 
 
 # ── Summarizer invocation tests ───────────────────────────────────────────────
