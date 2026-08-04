@@ -184,6 +184,7 @@ Resources:
           DEDUP_TABLE_NAME: !Ref DeduplicationTable
           CORRELATION_TABLE_NAME: !Ref CorrelationWindowTable
           INCIDENT_TABLE_NAME: !Ref IncidentTable
+          SERVICE_REGISTRY_TABLE_NAME: !Ref ServiceRegistryTable
           SUMMARIZER_FUNCTION_NAME: !Ref SummarizerFunction
           CORRELATION_WINDOW_MINUTES: "5"
       Policies:
@@ -193,6 +194,8 @@ Resources:
             TableName: !Ref CorrelationWindowTable
         - DynamoDBCrudPolicy:
             TableName: !Ref IncidentTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServiceRegistryTable
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
@@ -240,6 +243,26 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
+
+  # ── Service registry ─────────────────────────────────────────────────────────
+  # Materialised list of every service that has ever opened an incident. Exists so
+  # the dashboard can render service filters with a read that costs O(services)
+  # instead of scanning the incident table, which costs O(total table bytes) —
+  # ProjectionExpression trims the response, not the consumed capacity.
+  #
+  # Deliberately has no TimeToLiveSpecification. The incident table's TTL is what
+  # silently emptied the dashboard once already; this table must not inherit that.
+
+  ServiceRegistryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: affected_service
+          AttributeType: S
+      KeySchema:
+        - AttributeName: affected_service
+          KeyType: HASH
 
   # ── LLM summarizer ──────────────────────────────────────────────────────────
 
@@ -411,3 +434,7 @@ Outputs:
   IncidentTableName:
     Description: DynamoDB incident table name
     Value: !Ref IncidentTable
+
+  ServiceRegistryTableName:
+    Description: DynamoDB service registry table name
+    Value: !Ref ServiceRegistryTable

@@ -3,6 +3,7 @@
 
 Usage:
     DYNAMODB_TABLE=<table-name> \
+    SERVICE_REGISTRY_TABLE=<registry-table-name> \
     AWS_DEFAULT_REGION=us-east-1 \
     SLACK_BOT_TOKEN=xoxb-... \
     SLACK_CHANNEL_ID=C0B4L4L5H4J \
@@ -28,6 +29,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 TABLE_NAME = os.environ.get("DYNAMODB_TABLE")
+REGISTRY_TABLE_NAME = os.environ.get("SERVICE_REGISTRY_TABLE")
 REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
 if not TABLE_NAME:
@@ -595,6 +597,46 @@ def seed() -> None:
         for item in incidents:
             batch.put_item(Item=item)
     print(f"Done. Seeded {len(incidents)} incidents across {len(SERVICE_CONFIGS)} services.")
+
+    _seed_service_registry(incidents)
+
+
+def _seed_service_registry(incidents: list) -> None:
+    """Mirror the dedup Lambda's registry write for seeded incidents.
+
+    The dashboard reads its service filters from the registry, so seeding
+    incidents without seeding the registry leaves the filters empty.
+    """
+    if not REGISTRY_TABLE_NAME:
+        print(
+            "\nWarning: SERVICE_REGISTRY_TABLE not set — the service registry was not "
+            "populated, so dashboard service filters will be empty. Set it and re-run, "
+            "or run scripts/backfill_service_registry.py."
+        )
+        return
+
+    seen: dict[str, dict[str, str]] = {}
+    for incident in incidents:
+        service = incident["affected_service"]
+        created_at = incident["created_at"]
+        entry = seen.setdefault(service, {"first": created_at, "last": created_at})
+        entry["first"] = min(entry["first"], created_at)
+        entry["last"] = max(entry["last"], created_at)
+
+    registry = dynamodb.Table(REGISTRY_TABLE_NAME)
+    print(f"\nWriting {len(seen)} services to {REGISTRY_TABLE_NAME}...")
+    for service, entry in sorted(seen.items()):
+        # Matches the dedup Lambda: last_seen_at always advances, first_seen_at
+        # is only set the first time the service is seen.
+        registry.update_item(
+            Key={"affected_service": service},
+            UpdateExpression=(
+                "SET last_seen_at = :last, "
+                "first_seen_at = if_not_exists(first_seen_at, :first)"
+            ),
+            ExpressionAttributeValues={":first": entry["first"], ":last": entry["last"]},
+        )
+    print(f"Done. Registered {len(seen)} services.")
 
 
 if __name__ == "__main__":
