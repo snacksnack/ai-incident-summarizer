@@ -4,7 +4,7 @@ An AI-powered incident summarization system that ingests alerts from multiple ob
 
 Built with AWS Lambda (Python), SAM, DynamoDB, Claude, Next.js, and Vercel.
 
-**Live dashboard:** [ai-incident-summarizer.vercel.app](https://ai-incident-summarizer.vercel.app)
+**Live dashboard:** [incidents.hihelloreid.com](https://incidents.hihelloreid.com)
 
 ---
 
