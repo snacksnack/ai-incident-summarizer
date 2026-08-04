@@ -30,7 +30,11 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Pinned to match ci.yml so builds and deploys are reproducible and the
+      # validated template is built by the same toolchain that validated it.
       - uses: aws-actions/setup-sam@v2
+        with:
+          version: 1.165.0
 
       - name: Install test dependencies
         run: pip install -r tests/requirements-test.txt
