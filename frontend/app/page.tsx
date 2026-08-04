@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { Incident } from "@/lib/types";
+import { Incident, Service } from "@/lib/types";
 
 const SEVERITY_COLOURS: Record<string, string> = {
   critical: "bg-red-100 text-red-800",
@@ -11,7 +11,8 @@ const SEVERITY_COLOURS: Record<string, string> = {
   low: "bg-green-100 text-green-800",
 };
 
-const STATUS_OPTIONS = ["open", "acknowledged", "resolved"];
+const ALL_STATUSES = "all";
+const STATUS_OPTIONS = [ALL_STATUSES, "open", "acknowledged", "resolved"];
 
 function Badge({ value, colours }: { value: string; colours: Record<string, string> }) {
   const cls = colours[value.toLowerCase()] ?? "bg-gray-100 text-gray-800";
@@ -33,44 +34,100 @@ function summarySnippet(incident: Incident): string {
   }
 }
 
+type IncidentResult = { key: string; incidents: Incident[]; error: string | null };
+
 export default function IncidentListPage() {
-  const [incidents, setIncidents] = useState<Incident[]>([]);
   const [status, setStatus] = useState("open");
-  const [service, setService] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [picked, setPicked] = useState<string | null>(null);
+  const [services, setServices] = useState<string[] | null>(null);
+  const [result, setResult] = useState<IncidentResult | null>(null);
 
   useEffect(() => {
-    setLoading(true);
-    setError(null);
-
-    const params = new URLSearchParams();
-    if (service.trim()) {
-      params.set("service", service.trim());
-    } else {
-      params.set("status", status);
-    }
-
-    fetch(`/api/incidents?${params}`)
-      .then((r) => {
-        if (!r.ok) throw new Error("Request failed");
-        return r.json();
+    let cancelled = false;
+    fetch("/api/services")
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Request failed"))))
+      .then((data: Service[]) => {
+        if (!cancelled) setServices(data.map((s) => s.affected_service));
       })
-      .then(setIncidents)
-      .catch(() => setError("Failed to load incidents."))
-      .finally(() => setLoading(false));
-  }, [status, service]);
+      // The tag row is an enhancement over the search box, so a failure here
+      // degrades to "no tags" rather than breaking the incident list.
+      .catch(() => {
+        if (!cancelled) setServices([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const matchingServices = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const all = services ?? [];
+    return q ? all.filter((name) => name.toLowerCase().includes(q)) : all;
+  }, [services, query]);
+
+  // Typing the full name selects it, so partial or wrong-case input narrows the
+  // tags instead of firing an exact-match query that returns nothing.
+  const typedExactMatch = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return null;
+    return (services ?? []).find((name) => name.toLowerCase() === q) ?? null;
+  }, [services, query]);
+
+  const selectedService = picked ?? typedExactMatch;
+  const filterKey = `${status}|${selectedService ?? ""}`;
+
+  useEffect(() => {
+    let cancelled = false;
+    const params = new URLSearchParams({ status });
+    if (selectedService) params.set("service", selectedService);
+
+    // State is only set from async continuations — never synchronously during
+    // the effect — and stale responses are dropped so fast filter switching
+    // cannot render the wrong result set.
+    fetch(`/api/incidents?${params}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Request failed"))))
+      .then((incidents: Incident[]) => {
+        if (!cancelled) setResult({ key: filterKey, incidents, error: null });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setResult({ key: filterKey, incidents: [], error: "Failed to load incidents." });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [filterKey, status, selectedService]);
+
+  const loading = result?.key !== filterKey;
+  const incidents = result?.incidents ?? [];
+  const error = result?.error ?? null;
+
+  function toggleService(name: string) {
+    if (selectedService === name) {
+      setPicked(null);
+      setQuery("");
+    } else {
+      setPicked(name);
+      setQuery(name);
+    }
+  }
 
   return (
     <main className="max-w-5xl mx-auto px-4 py-8">
       <h1 className="text-2xl font-bold text-gray-900 mb-6">Incident Dashboard</h1>
 
-      <div className="flex flex-wrap gap-4 mb-6">
+      <div className="flex flex-wrap gap-4 mb-4">
         <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Status</label>
+          <label htmlFor="status" className="block text-sm font-medium text-gray-700 mb-1">
+            Status
+          </label>
           <select
+            id="status"
             value={status}
-            onChange={(e) => { setStatus(e.target.value); setService(""); }}
+            onChange={(e) => setStatus(e.target.value)}
             className="border border-gray-300 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
           >
             {STATUS_OPTIONS.map((s) => (
@@ -79,19 +136,56 @@ export default function IncidentListPage() {
           </select>
         </div>
         <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Service</label>
+          <label htmlFor="service" className="block text-sm font-medium text-gray-700 mb-1">
+            Service
+          </label>
           <input
+            id="service"
             type="text"
-            placeholder="e.g. payments-service"
-            value={service}
-            onChange={(e) => setService(e.target.value)}
+            placeholder="Filter services…"
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setPicked(null);
+            }}
             className="border border-gray-300 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 w-56"
           />
         </div>
       </div>
 
+      <div className="mb-6">
+        {services === null && <p className="text-sm text-gray-400">Loading services…</p>}
+        {services !== null && matchingServices.length === 0 && (
+          <p className="text-sm text-gray-500">
+            {query.trim() ? `No services match “${query.trim()}”.` : "No services found."}
+          </p>
+        )}
+        {matchingServices.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {matchingServices.map((name) => {
+              const active = selectedService === name;
+              return (
+                <button
+                  key={name}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => toggleService(name)}
+                  className={`px-2.5 py-1 rounded-full border text-xs font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 ${
+                    active
+                      ? "bg-blue-600 border-blue-600 text-white"
+                      : "bg-white border-gray-300 text-gray-700 hover:bg-gray-50"
+                  }`}
+                >
+                  {name}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
       {loading && <p className="text-sm text-gray-500">Loading…</p>}
-      {error && <p className="text-sm text-red-600">{error}</p>}
+      {!loading && error && <p className="text-sm text-red-600">{error}</p>}
       {!loading && !error && incidents.length === 0 && (
         <p className="text-sm text-gray-500">No incidents found.</p>
       )}
