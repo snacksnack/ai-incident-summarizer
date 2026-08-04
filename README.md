@@ -62,7 +62,7 @@ EventBridge        API Gateway (HMAC validation)
 | `slack_thread_id` | Enables Slack reply threading |
 | `jira_ticket_id` | Linked Jira ticket |
 | `created_at` | ISO timestamp |
-| `ttl` | Auto-expires resolved incidents after 30 days |
+| `ttl` | Optional expiry timestamp. TTL is enabled on the table, so any incident carrying this attribute is deleted by DynamoDB once it passes. Neither the pipeline nor the seed script sets it — omit it unless you want the incident to disappear. |
 
 **GSIs:**
 - `service-created-index` — query all incidents for a given service

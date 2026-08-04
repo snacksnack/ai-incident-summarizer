@@ -38,7 +38,10 @@ dynamodb = boto3.resource("dynamodb", region_name=REGION)
 table = dynamodb.Table(TABLE_NAME)
 
 NOW = datetime.now(timezone.utc)
-TTL_DAYS = 30
+
+# Seeded incidents deliberately carry no `ttl` attribute. IncidentTable has TTL
+# enabled on `ttl`, so any value here would expire the demo data and leave the
+# dashboard empty — which is exactly what happened to the first seed.
 
 # 9 incidents per service: 3 open, 4 resolved, 2 acknowledged
 STATUSES = [
@@ -139,7 +142,6 @@ def _create_jira_ticket(incident: dict) -> str:
 def _make_incident(idx: int, service_key: str, severity: str, scenario: dict) -> dict:
     status = STATUSES[idx]
     created_at = NOW - timedelta(days=DAY_OFFSETS[idx], hours=HOUR_OFFSETS[idx])
-    ttl = int(created_at.timestamp()) + TTL_DAYS * 24 * 60 * 60
     incident_id = f"seed-{service_key}-{idx + 1:03d}"
 
     alert_time = created_at
@@ -168,7 +170,6 @@ def _make_incident(idx: int, service_key: str, severity: str, scenario: dict) ->
             "next_step": scenario["next_step"],
         }),
         "created_at": _iso_z(created_at),
-        "ttl": ttl,
     }
 
 
