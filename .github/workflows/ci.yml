@@ -15,9 +15,17 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Pinned deliberately. `sam validate --lint` runs cfn-lint bundled inside the
+      # SAM CLI, and cfn-lint ships a dataset of Lambda runtime deprecation dates
+      # that changes between releases. Left unpinned, this gate can start or stop
+      # reporting findings with no change to the template — which is exactly how a
+      # developer's local run and CI came to disagree (RC1-223).
+      #
+      # Bump this version deliberately, and keep local SAM CLI on the same version.
       - uses: aws-actions/setup-sam@v2
         with:
           use-installer: true
+          version: 1.165.0
 
       - name: Install test dependencies
         run: pip install -r tests/requirements-test.txt
