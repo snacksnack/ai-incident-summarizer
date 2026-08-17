@@ -211,6 +211,30 @@ Datadog's webhook integration does not support HMAC payload signing natively, un
 
 ---
 
+## Evals
+
+The incident summary runs under the shared [agent-evals](https://github.com/snacksnack/agent-evals)
+harness (RC1-267), in two layers:
+
+- **Layer 1 — free, on every push.** `pytest` covers the prompt/parser
+  contract: `_call_llm` parses the model's response with a bare `json.loads`,
+  so the prompt's raw-three-field-JSON clauses are load-bearing. Editing them
+  without keeping the contract fails CI instead of silently degrading
+  production to the fallback summary.
+- **Layer 2 — billed, deliberate.** `python -m evals` binds fixture incidents
+  into the shipped prompt, calls the model `template.yaml` pins, and scores
+  the output: the contract on real output, the handed-over facts, and that the
+  model restates the computed severity rather than re-deciding it. Needs
+  `ANTHROPIC_API_KEY` in the environment and
+  `pip install -r requirements-evals.txt`.
+
+Runs land in the shared store and render on the public
+[quality trend page](https://snacksnack.github.io/agent-evals/) as subject
+`incident-summary`; [docs/measuring.md](https://github.com/snacksnack/agent-evals/blob/main/docs/measuring.md)
+is the runbook for taking a measurement end to end.
+
+---
+
 ## Jira epic
 
-This project is tracked under epic **RC1-31** at [hirereidcollins.atlassian.net](https://hirereidcollins.atlassian.net).
+This project is tracked under epic **RC1-31** at [hirereidcollins.atlassian.net](https://hirereidcollins.atlassian.net). The eval suite is RC1-267 under epic RC1-230.

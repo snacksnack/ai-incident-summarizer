@@ -1,0 +1,9 @@
+# Layer 2 eval dependencies (RC1-267). Layer 1 (`pytest`) needs only
+# tests/requirements-test.txt and runs in CI; this file is for the billed
+# suite run on a developer machine: `python -m evals`.
+
+anthropic>=0.40
+
+# The shared eval harness. Pinned by tag — if the ruler can move under a run, a
+# changed score no longer says whether the prompt drifted or the measurement did.
+agent-evals[sql] @ git+https://github.com/snacksnack/agent-evals@v0.3.0
