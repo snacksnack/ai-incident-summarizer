@@ -25,9 +25,21 @@ Following RC1-258's finding, the check demands the other levels be *absent as
 assertions*, not just the right one present — "critical incident, though
 individual alerts are high severity" contains both. And severity words inside
 quoted alert names must not count as assertions, which is why matching works
-on tight severity phrases rather than bare level words: the alarm
+on severity phrases rather than bare level words: the alarm
 "payments-service-high-error-rate" flattens to "high error", never to
 "high severity".
+
+Both guards below were bought by running it, the same way RC1-258's were:
+
+* **an assertion survives an intervening modifier.** The first real run
+  described the critical incident as "a critical multi-signal degradation" —
+  a correct assertion that adjacent-phrase matching missed, failing the case
+  wrongly. Levels now match within two words of an incident noun.
+* **known gap, recorded rather than gated:** the same output claimed "three
+  concurrent P1 alerts" when the input held one P1 and two highs. Alert-level
+  claims are not yet checked; `numbers-trace-to-the-input` stays advisory
+  precisely because deciding which derived claims are inventions is the part
+  that is not yet precise enough to gate.
 """
 
 from __future__ import annotations
@@ -153,27 +165,31 @@ def _states_facts(text: str, fixture: fixtures.Fixture) -> CharacteristicResult:
     )
 
 
-#: A severity *assertion*, as distinct from a severity word inside a quoted
-#: alert name. Tight on purpose — precision over recall, like every checker in
-#: the harness. Matched against flattened text, so hyphens and colons are free.
-def _assertion_phrases(level: str) -> tuple[str, ...]:
-    return (
-        f"{level} severity",
-        f"severity {level}",
-        f"severity is {level}",
-        f"severity of {level}",
-        f"{level} priority",
-        f"{level} incident",
-    )
+#: The nouns a severity adjective attaches to when it is being *asserted* of
+#: this incident. Deliberately excludes the words real outputs use for other
+#: things — "rates", "latency", "path", "dependencies" — so "high error rates"
+#: and "critical path" never read as severity claims.
+_SEVERITY_NOUNS = "incident|outage|degradation|failure|situation|severity"
+
+
+def _asserts_level(flat: str, level: str) -> bool:
+    """Is `level` claimed as this incident's severity?
+
+    Three shapes, precision over recall: "severity [is/of] <level>",
+    "<level> priority", and the adjective form — the level word within two
+    words of an incident noun, so "critical multi-signal degradation" matches
+    without "high error rates" ever doing so.
+    """
+    if re.search(rf"\bseverity(?:\s+\w+)?\s+{level}\b", flat):
+        return True
+    if re.search(rf"\b{level}\s+priority\b", flat):
+        return True
+    return bool(re.search(rf"\b{level}\b(?:\s+[\w/]+){{0,2}}\s+(?:{_SEVERITY_NOUNS})\b", flat))
 
 
 def _restates_severity(text: str, fixture: fixtures.Fixture) -> CharacteristicResult:
     flat = _flatten(text)
-    asserted = [
-        level
-        for level in fixtures.SEVERITIES
-        if any(p in flat for p in _assertion_phrases(level))
-    ]
+    asserted = [level for level in fixtures.SEVERITIES if _asserts_level(flat, level)]
     correct = fixture.severity in asserted
     contradicting = [s for s in asserted if s != fixture.severity]
     return CharacteristicResult(
