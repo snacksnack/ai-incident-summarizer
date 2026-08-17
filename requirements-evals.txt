@@ -6,4 +6,5 @@ anthropic>=0.40
 
 # The shared eval harness. Pinned by tag — if the ruler can move under a run, a
 # changed score no longer says whether the prompt drifted or the measurement did.
-agent-evals[sql] @ git+https://github.com/snacksnack/agent-evals@v0.3.0
+# v0.3.1: prices claude-sonnet-4-6, so this suite's runs carry real cost.
+agent-evals[sql] @ git+https://github.com/snacksnack/agent-evals@v0.3.1

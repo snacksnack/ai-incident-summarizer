@@ -48,6 +48,7 @@ import json
 import re
 import time
 
+from agent_evals import pricing
 from agent_evals.case import Case
 from agent_evals.record import CaseResult, CharacteristicResult, SubjectVersion, Usage
 
@@ -274,12 +275,18 @@ def run(case: Case, client) -> CaseResult:
         )
     latency_ms = (time.perf_counter() - started) * 1000
 
+    input_tokens = getattr(response.usage, "input_tokens", 0)
+    output_tokens = getattr(response.usage, "output_tokens", 0)
     return CaseResult(
         case_id=case.id,
         characteristics=_score(text, fixture, prompt),
         usage=Usage(
-            input_tokens=getattr(response.usage, "input_tokens", 0),
-            output_tokens=getattr(response.usage, "output_tokens", 0),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            # Priced, not counted: the first runs recorded $0, which the trend
+            # page dutifully displayed as "free" for a billed suite (RC1-254's
+            # exact finding, reproduced here).
+            cost_usd=pricing.cost_usd(summarizer.model(), input_tokens, output_tokens),
             latency_ms=latency_ms,
         ),
         observations={
