@@ -421,3 +421,106 @@ class TestSummarizerInvocation:
         mock_dedup_table.put_item.side_effect = _conditional_check_failed_error()
         app.handler(ALERT, None)
         mock_lambda_client.invoke.assert_not_called()
+
+
+# ── Recoveries (RC1-374) ─────────────────────────────────────────────────────
+
+RESOLVED_ALERT = {**ALERT, "alert_id": "test-id-456", "status": "resolved", "severity": "low",
+                  "received_at": "2024-01-15T10:45:00Z"}
+OPEN_INCIDENT = {
+    "incident_id": "inc-open-1",
+    "affected_service": "payments-service",
+    "severity": "high",
+    "status": "open",
+    "created_at": "2024-01-15T10:30:07Z",
+    "source_alerts": [{"alert_id": "test-id-123", "source": "cloudwatch",
+                       "alert_name": "payments-service-error-rate", "severity": "high",
+                       "status": "open", "received_at": "2024-01-15T10:30:00Z"}],
+}
+
+
+class TestRecovery:
+    def _incidents(self, mock_incident_table, *incidents):
+        mock_incident_table.query.return_value = {"Items": list(incidents)}
+        mock_incident_table.update_item.return_value = {}
+
+    def test_recovery_closes_matching_open_incident(self, dedup):
+        app, mock_dedup_table, mock_window_table, mock_incident_table, mock_lambda = dedup
+        self._incidents(mock_incident_table, OPEN_INCIDENT)
+        result = app.handler(RESOLVED_ALERT, None)
+        assert result["resolved"] is True
+        assert result["incident_id"] == "inc-open-1"
+        assert result["alert_count"] == 2
+        kwargs = mock_incident_table.update_item.call_args[1]
+        assert kwargs["Key"] == {"incident_id": "inc-open-1"}
+        assert kwargs["ExpressionAttributeValues"][":resolved"] == "resolved"
+        assert kwargs["ExpressionAttributeValues"][":s"][0]["status"] == "resolved"
+        assert "resolved_at" in kwargs["UpdateExpression"]
+
+    def test_recovery_looks_up_by_service_index(self, dedup):
+        app, _, _, mock_incident_table, _ = dedup
+        self._incidents(mock_incident_table, OPEN_INCIDENT)
+        app.handler(RESOLVED_ALERT, None)
+        assert mock_incident_table.query.call_args[1]["IndexName"] == "service-created-index"
+
+    def test_recovery_retires_window_and_fingerprint(self, dedup):
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
+        self._incidents(mock_incident_table, OPEN_INCIDENT)
+        app.handler(RESOLVED_ALERT, None)
+        mock_window_table.delete_item.assert_called_once()
+        assert mock_window_table.delete_item.call_args[1]["Key"] == {"service_key": "payments-service"}
+        mock_dedup_table.delete_item.assert_called_once_with(Key={"fingerprint": generate_fingerprint(
+            ALERT["source"], ALERT["alert_name"], ALERT["affected_service"])})
+        mock_dedup_table.put_item.assert_not_called()
+
+    def test_recovery_invokes_summarizer_with_flag(self, dedup):
+        app, _, _, mock_incident_table, mock_lambda = dedup
+        self._incidents(mock_incident_table, OPEN_INCIDENT)
+        app.handler(RESOLVED_ALERT, None)
+        mock_lambda.invoke.assert_called_once()
+        assert json.loads(mock_lambda.invoke.call_args[1]["Payload"]) == {"incident_id": "inc-open-1", "recovered": True}
+
+    def test_recovery_with_no_open_incident_is_dropped(self, dedup, caplog):
+        app, mock_dedup_table, mock_window_table, mock_incident_table, mock_lambda = dedup
+        self._incidents(mock_incident_table)
+        with caplog.at_level("INFO"):
+            assert app.handler(RESOLVED_ALERT, None) is None
+        mock_incident_table.update_item.assert_not_called()
+        mock_incident_table.put_item.assert_not_called()
+        mock_lambda.invoke.assert_not_called()
+        mock_dedup_table.put_item.assert_not_called()
+        assert "no open incident" in caplog.text
+
+    def test_recovery_ignores_resolved_and_unrelated_incidents(self, dedup):
+        app, _, _, mock_incident_table, mock_lambda = dedup
+        already = {**OPEN_INCIDENT, "incident_id": "inc-done", "status": "resolved"}
+        other = {**OPEN_INCIDENT, "incident_id": "inc-other", "source_alerts": [
+            {**OPEN_INCIDENT["source_alerts"][0], "alert_name": "different-alarm"}]}
+        self._incidents(mock_incident_table, already, other)
+        assert app.handler(RESOLVED_ALERT, None) is None
+        mock_lambda.invoke.assert_not_called()
+
+    def test_duplicate_recovery_is_dropped_when_already_closed(self, dedup):
+        app, _, mock_window_table, mock_incident_table, mock_lambda = dedup
+        self._incidents(mock_incident_table, OPEN_INCIDENT)
+        mock_incident_table.update_item.side_effect = _conditional_check_failed_error()
+        assert app.handler(RESOLVED_ALERT, None) is None
+        mock_lambda.invoke.assert_not_called()
+        mock_window_table.delete_item.assert_not_called()
+
+    def test_window_owned_by_newer_incident_is_left_alone(self, dedup):
+        app, _, mock_window_table, mock_incident_table, mock_lambda = dedup
+        self._incidents(mock_incident_table, OPEN_INCIDENT)
+        mock_window_table.delete_item.side_effect = _conditional_check_failed_error()
+        result = app.handler(RESOLVED_ALERT, None)
+        assert result["resolved"] is True
+        mock_lambda.invoke.assert_called_once()
+
+    def test_open_alert_path_is_unchanged(self, dedup):
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
+        mock_dedup_table.put_item.return_value = {}
+        mock_window_table.put_item.return_value = {}
+        mock_incident_table.put_item.return_value = {}
+        result = app.handler(ALERT, None)
+        assert result["is_new"] is True
+        mock_incident_table.query.assert_not_called()

@@ -1,3 +1,4 @@
+import json
 import time
 from unittest.mock import patch
 
@@ -150,3 +151,70 @@ class TestDedupExpiry:
         assert again is not None
         assert again["is_new"] is True
         assert again["incident_id"] != first["incident_id"]
+
+
+class TestRecoveryClosesIncident:
+    """RC1-374: a resolved alert closes the open incident it belongs to."""
+
+    def _recovery(self, alert):
+        return {**alert, "alert_id": alert["alert_id"] + "-ok", "status": "resolved", "severity": "low",
+                "received_at": "2024-01-15T10:45:00Z"}
+
+    def test_recovery_marks_incident_resolved_and_appends_alert(self, dedup_app, dynamodb_tables):
+        alert = _make_alert("payments-service", alert_name="error-rate")
+        opened = dedup_app.handler(alert, None)
+        closed = dedup_app.handler(self._recovery(alert), None)
+
+        assert closed["resolved"] is True
+        assert closed["incident_id"] == opened["incident_id"]
+        _, _, incident_table = dynamodb_tables
+        item = incident_table.get_item(Key={"incident_id": opened["incident_id"]})["Item"]
+        assert item["status"] == "resolved"
+        assert item["resolved_at"]
+        assert [a["status"] for a in item["source_alerts"]] == ["open", "resolved"]
+
+    def test_recovery_hands_off_to_summarizer_with_flag(self, dedup_app):
+        alert = _make_alert("payments-service", alert_name="error-rate")
+        dedup_app.handler(alert, None)
+        dedup_app.handler(self._recovery(alert), None)
+        payloads = [json.loads(c[1]["Payload"]) for c in dedup_app._lambda_client.invoke.call_args_list]
+        assert payloads[-1]["recovered"] is True
+
+    def test_recovery_retires_window_and_fingerprint_rows(self, dedup_app, dynamodb_tables):
+        alert = _make_alert("payments-service", alert_name="error-rate")
+        dedup_app.handler(alert, None)
+        dedup_app.handler(self._recovery(alert), None)
+        dedup_table, window_table, _ = dynamodb_tables
+        assert "Item" not in window_table.get_item(Key={"service_key": "payments-service"})
+        fp = dedup_app.generate_fingerprint(source=alert["source"], alert_name=alert["alert_name"],
+                                            affected_service=alert["affected_service"])
+        assert "Item" not in dedup_table.get_item(Key={"fingerprint": fp})
+
+    def test_new_alert_after_recovery_opens_a_new_incident(self, dedup_app):
+        alert = _make_alert("payments-service", alert_name="error-rate")
+        first = dedup_app.handler(alert, None)
+        dedup_app.handler(self._recovery(alert), None)
+        again = dedup_app.handler({**alert, "alert_id": "alert-payments-service-2"}, None)
+        assert again["is_new"] is True
+        assert again["incident_id"] != first["incident_id"]
+
+    def test_recovery_without_open_incident_is_dropped(self, dedup_app, dynamodb_tables):
+        alert = _make_alert("payments-service", alert_name="error-rate")
+        assert dedup_app.handler(self._recovery(alert), None) is None
+        _, _, incident_table = dynamodb_tables
+        assert incident_table.scan()["Count"] == 0
+        dedup_app._lambda_client.invoke.assert_not_called()
+
+    def test_second_recovery_is_dropped(self, dedup_app):
+        alert = _make_alert("payments-service", alert_name="error-rate")
+        dedup_app.handler(alert, None)
+        assert dedup_app.handler(self._recovery(alert), None)["resolved"] is True
+        assert dedup_app.handler(self._recovery(alert), None) is None
+
+    def test_recovery_of_other_alert_does_not_close_incident(self, dedup_app, dynamodb_tables):
+        alert = _make_alert("payments-service", alert_name="error-rate")
+        opened = dedup_app.handler(alert, None)
+        other = _make_alert("payments-service", alert_name="latency")
+        assert dedup_app.handler(self._recovery(other), None) is None
+        _, _, incident_table = dynamodb_tables
+        assert incident_table.get_item(Key={"incident_id": opened["incident_id"]})["Item"]["status"] == "open"

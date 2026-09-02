@@ -185,3 +185,61 @@ class TestPrompt:
         prompt = app._build_prompt(INCIDENT)
         assert "2024-01-15T10:00:00Z" in prompt
         assert "2024-01-15T10:02:00Z" in prompt
+
+
+# ── Recovery (RC1-374) ───────────────────────────────────────────────────────
+
+RESOLVED_INCIDENT = {**INCIDENT, "status": "resolved", "resolved_at": "2024-01-15T10:42:30Z",
+                     "llm_summary": json.dumps(LLM_RESPONSE)}
+RECOVERY_RESPONSE = {
+    "summary": "Payments recovered after 42 minutes.",
+    "likely_cause": "Connection pool exhaustion, cleared by the restart.",
+    "next_step": "Raise the pool ceiling and add an alarm on saturation.",
+}
+
+
+class TestRecovery:
+    def _run(self, app, mock_table, response=RECOVERY_RESPONSE, incident=RESOLVED_INCIDENT):
+        mock_table.get_item.return_value = {"Item": incident}
+        with patch("anthropic.Anthropic", _mock_anthropic(response)) as mock_anthropic:
+            result = app.handler({"incident_id": "inc-123", "recovered": True}, None)
+        return result, mock_anthropic
+
+    def test_writes_recovery_summary_not_llm_summary(self, summarizer):
+        app, mock_table, *_ = summarizer
+        self._run(app, mock_table)
+        kwargs = mock_table.update_item.call_args[1]
+        assert kwargs["UpdateExpression"] == "SET recovery_summary = :s"
+        assert json.loads(kwargs["ExpressionAttributeValues"][":s"]) == RECOVERY_RESPONSE
+
+    def test_recovery_prompt_describes_the_recovery(self, summarizer):
+        app, mock_table, *_ = summarizer
+        _, mock_anthropic = self._run(app, mock_table)
+        prompt = mock_anthropic.return_value.messages.create.call_args[1]["messages"][0]["content"]
+        assert "RECOVERED" in prompt
+        assert "42m 30s" in prompt
+        assert "2024-01-15T10:42:30Z" in prompt
+        assert LLM_RESPONSE["summary"] in prompt
+
+    def test_recovery_hands_off_to_slack_with_flag(self, summarizer):
+        app, mock_table, _ = summarizer
+        self._run(app, mock_table)
+        payload = json.loads(app._lambda_client.invoke.call_args[1]["Payload"])
+        assert payload == {"incident_id": "inc-123", "recovered": True}
+
+    def test_recovery_fallback_mentions_duration(self, summarizer):
+        app, mock_table, *_ = summarizer
+        mock_table.get_item.return_value = {"Item": RESOLVED_INCIDENT}
+        failing = MagicMock()
+        failing.return_value.messages.create.side_effect = RuntimeError("boom")
+        with patch("anthropic.Anthropic", failing):
+            app.handler({"incident_id": "inc-123", "recovered": True}, None)
+        written = json.loads(mock_table.update_item.call_args[1]["ExpressionAttributeValues"][":s"])
+        assert "recovered after 42m 30s" in written["summary"]
+
+    def test_open_incident_handoff_carries_no_flag(self, summarizer):
+        app, mock_table, _ = summarizer
+        mock_table.get_item.return_value = {"Item": INCIDENT}
+        with patch("anthropic.Anthropic", _mock_anthropic()):
+            app.handler({"incident_id": "inc-123"}, None)
+        assert json.loads(app._lambda_client.invoke.call_args[1]["Payload"]) == {"incident_id": "inc-123"}

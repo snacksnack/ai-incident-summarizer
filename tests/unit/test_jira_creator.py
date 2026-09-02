@@ -336,3 +336,91 @@ class TestTokenCaching:
             app.handler({"incident_id": "inc-123"}, None)
             app.handler({"incident_id": "inc-123"}, None)
         assert mock_secrets.get_secret_value.call_count == 1
+
+
+# ── Recovery (RC1-374) ───────────────────────────────────────────────────────
+
+RESOLVED_INCIDENT = {
+    **INCIDENT_WITH_JIRA,
+    "status": "resolved",
+    "resolved_at": "2024-01-15T10:42:30Z",
+    "recovery_summary": json.dumps({
+        "summary": "Payments recovered after 42 minutes.",
+        "likely_cause": "Pool exhaustion.",
+        "next_step": "Raise the pool ceiling.",
+    }),
+}
+
+
+def _ok(json_body=None):
+    r = MagicMock()
+    r.ok = True
+    r.status_code = 200
+    r.json.return_value = json_body or {}
+    return r
+
+
+class TestRecovery:
+    def _run(self, app, mock_table, incident=RESOLVED_INCIDENT, transitions=None):
+        mock_table.get_item.return_value = {"Item": incident}
+        transitions = transitions if transitions is not None else [
+            {"id": "11", "name": "In Progress", "to": {"statusCategory": {"key": "indeterminate"}}},
+            {"id": "31", "name": "Done", "to": {"statusCategory": {"key": "done"}}},
+        ]
+        with patch("requests.post", return_value=_ok()) as mock_post, \
+             patch("requests.get", return_value=_ok({"transitions": transitions})) as mock_get:
+            result = app.handler({"incident_id": "inc-123", "recovered": True}, None)
+        return result, mock_post, mock_get
+
+    def test_recovery_comments_on_the_ticket_instead_of_creating(self, jira):
+        app, mock_table, _ = jira
+        result, mock_post, _ = self._run(app, mock_table)
+        urls = [c[0][0] for c in mock_post.call_args_list]
+        assert f"{JIRA_BASE_URL}/rest/api/3/issue/INC-42/comment" in urls
+        assert f"{JIRA_BASE_URL}/rest/api/3/issue" not in urls
+        mock_table.update_item.assert_not_called()
+        assert result == {"incident_id": "inc-123", "jira_ticket_id": "INC-42", "resolved": True}
+
+    def test_recovery_comment_carries_the_summary(self, jira):
+        app, mock_table, _ = jira
+        _, mock_post, _ = self._run(app, mock_table)
+        comment_call = next(c for c in mock_post.call_args_list if c[0][0].endswith("/comment"))
+        text = json.dumps(comment_call[1]["json"]["body"])
+        assert "Incident resolved." in text
+        assert "Payments recovered after 42 minutes." in text
+        assert "2024-01-15T10:42:30Z" in text
+
+    def test_recovery_transitions_to_done_category(self, jira):
+        app, mock_table, _ = jira
+        _, mock_post, _ = self._run(app, mock_table)
+        transition_call = next(c for c in mock_post.call_args_list if c[0][0].endswith("/transitions"))
+        assert transition_call[1]["json"] == {"transition": {"id": "31"}}
+
+    def test_recovery_without_done_transition_only_comments(self, jira):
+        app, mock_table, _ = jira
+        _, mock_post, _ = self._run(app, mock_table, transitions=[
+            {"id": "11", "name": "In Progress", "to": {"statusCategory": {"key": "indeterminate"}}}])
+        assert not any(c[0][0].endswith("/transitions") for c in mock_post.call_args_list)
+
+    def test_recovery_hands_off_to_datadog_with_flag(self, jira):
+        app, mock_table, _ = jira
+        self._run(app, mock_table)
+        payload = json.loads(app._lambda_client.invoke.call_args[1]["Payload"])
+        assert payload == {"incident_id": "inc-123", "recovered": True}
+
+    def test_recovery_without_ticket_skips_jira_but_hands_off(self, jira):
+        app, mock_table, _ = jira
+        incident = {k: v for k, v in RESOLVED_INCIDENT.items() if k != "jira_ticket_id"}
+        result, mock_post, mock_get = self._run(app, mock_table, incident=incident)
+        mock_post.assert_not_called()
+        mock_get.assert_not_called()
+        assert json.loads(app._lambda_client.invoke.call_args[1]["Payload"])["recovered"] is True
+        assert result["jira_ticket_id"] is None
+
+    def test_jira_failure_on_recovery_does_not_block_handoff(self, jira):
+        app, mock_table, _ = jira
+        mock_table.get_item.return_value = {"Item": RESOLVED_INCIDENT}
+        bad = MagicMock(); bad.ok = False; bad.status_code = 500; bad.text = "boom"
+        with patch("requests.post", return_value=bad), patch("requests.get", return_value=bad):
+            app.handler({"incident_id": "inc-123", "recovered": True}, None)
+        app._lambda_client.invoke.assert_called_once()

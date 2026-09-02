@@ -284,14 +284,18 @@ class TestGitHub:
         assert result["status"] == "open"
         assert result["severity"] == "medium"
 
-    # RC1-373: only completed, non-successful workflow runs are alerts.
-    def test_success_is_ignored(self, normalizer, mock_lambda):
-        assert normalizer.handler(_gh_envelope(conclusion="success"), None) is None
-        mock_lambda.invoke.assert_not_called()
+    # RC1-373: only completed workflow runs are alerts. RC1-374: a successful
+    # one is a recovery (status resolved) that dedup closes an incident with.
+    def test_success_is_a_recovery(self, normalizer, mock_lambda):
+        result = normalizer.handler(_gh_envelope(conclusion="success"), None)
+        assert result["status"] == "resolved"
+        assert result["severity"] == "low"
+        assert result["alert_name"] == "CI"
+        mock_lambda.invoke.assert_called_once()
 
-    def test_skipped_and_neutral_are_ignored(self, normalizer):
-        assert normalizer.handler(_gh_envelope(conclusion="skipped"), None) is None
-        assert normalizer.handler(_gh_envelope(conclusion="neutral"), None) is None
+    def test_skipped_and_neutral_are_recoveries(self, normalizer):
+        assert normalizer.handler(_gh_envelope(conclusion="skipped"), None)["status"] == "resolved"
+        assert normalizer.handler(_gh_envelope(conclusion="neutral"), None)["status"] == "resolved"
 
     def test_in_progress_run_is_ignored_without_error(self, normalizer, mock_lambda, caplog):
         env = _gh_envelope(action="in_progress")

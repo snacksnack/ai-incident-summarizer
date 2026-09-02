@@ -28,6 +28,8 @@ export interface Incident {
   created_at: string;
   source_alerts: SourceAlert[];
   llm_summary?: string;
+  recovery_summary?: string;
+  resolved_at?: string;
   slack_thread_id?: string;
   jira_ticket_id?: string;
 }

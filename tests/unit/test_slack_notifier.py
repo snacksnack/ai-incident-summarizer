@@ -277,3 +277,61 @@ class TestRetry:
             with pytest.raises(SlackApiError):
                 app.handler({"incident_id": "inc-123"}, None)
         assert mock_slack.chat_postMessage.call_count == 3
+
+
+# ── Recovery (RC1-374) ───────────────────────────────────────────────────────
+
+RESOLVED_INCIDENT = {
+    **INCIDENT_WITH_THREAD,
+    "status": "resolved",
+    "resolved_at": "2024-01-15T10:42:30Z",
+    "recovery_summary": json.dumps({
+        "summary": "Payments recovered after 42 minutes.",
+        "likely_cause": "Pool exhaustion, cleared by the restart.",
+        "next_step": "Raise the pool ceiling.",
+    }),
+}
+
+
+class TestRecovery:
+    def _post(self, app, mock_table, incident=RESOLVED_INCIDENT):
+        mock_table.get_item.return_value = {"Item": incident}
+        mock_slack = MagicMock()
+        mock_slack.chat_postMessage.return_value = {"ts": "1705312999.000001"}
+        with patch("app.WebClient", return_value=mock_slack):
+            app.handler({"incident_id": "inc-123", "recovered": True}, None)
+        return mock_slack.chat_postMessage.call_args[1]
+
+    def test_recovery_replies_in_the_existing_thread(self, notifier):
+        app, mock_table, _ = notifier
+        kwargs = self._post(app, mock_table)
+        assert kwargs["thread_ts"] == INCIDENT_WITH_THREAD["slack_thread_id"]
+        mock_table.update_item.assert_not_called()
+
+    def test_recovery_message_has_resolved_header_and_duration(self, notifier):
+        app, mock_table, _ = notifier
+        text = self._post(app, mock_table)["text"]
+        assert text.startswith("🟢 *RESOLVED* | payments-service | 2024-01-15T10:42:30Z | open for 42m 30s")
+        assert "Payments recovered after 42 minutes." in text
+        assert "Raise the pool ceiling." in text
+
+    def test_recovery_falls_back_to_alert_list_without_summary(self, notifier):
+        app, mock_table, _ = notifier
+        text = self._post(app, mock_table, {k: v for k, v in RESOLVED_INCIDENT.items() if k != "recovery_summary"})["text"]
+        assert "Incident resolved." in text
+        assert "high-error-rate" in text
+
+    def test_recovery_hands_off_to_jira_with_flag(self, notifier):
+        app, mock_table, _ = notifier
+        self._post(app, mock_table)
+        payload = json.loads(app._lambda_client.invoke.call_args[1]["Payload"])
+        assert payload == {"incident_id": "inc-123", "recovered": True}
+
+    def test_open_incident_handoff_carries_no_flag(self, notifier):
+        app, mock_table, _ = notifier
+        mock_table.get_item.return_value = {"Item": INCIDENT_WITH_THREAD}
+        mock_slack = MagicMock()
+        mock_slack.chat_postMessage.return_value = {"ts": "x"}
+        with patch("app.WebClient", return_value=mock_slack):
+            app.handler({"incident_id": "inc-123"}, None)
+        assert json.loads(app._lambda_client.invoke.call_args[1]["Payload"]) == {"incident_id": "inc-123"}

@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 
 import boto3
-from boto3.dynamodb.conditions import Attr
+from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 
 from common.fingerprint import generate_fingerprint
@@ -197,12 +197,103 @@ def _persist_incident(event: dict, grouping: dict) -> None:
         logger.info("Updated incident: incident_id=%s alert_count=%s", incident_id, grouping["alert_count"])
 
 
+def _find_open_incident(event: dict) -> dict | None:
+    """The newest open incident for this service carrying an alert with the same
+    source and name — the one a recovery of that alert closes."""
+    response = _get_incident_table().query(
+        IndexName="service-created-index",
+        KeyConditionExpression=Key("affected_service").eq(event["affected_service"]),
+        ScanIndexForward=False,
+        Limit=10,
+    )
+    for incident in response.get("Items", []):
+        if incident.get("status") != "open":
+            continue
+        for alert in incident.get("source_alerts", []):
+            if alert.get("source") == event["source"] and alert.get("alert_name") == event["alert_name"]:
+                return incident
+    return None
+
+
+def _close_incident(event: dict, incident: dict, fingerprint: str) -> bool:
+    """Append the recovery, mark the incident resolved, and retire the window
+    and fingerprint rows so the next alert opens a fresh incident. False when a
+    concurrent recovery already closed it."""
+    incident_id = incident["incident_id"]
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        _get_incident_table().update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression=(
+                "SET source_alerts = list_append(source_alerts, :s), "
+                "#st = :resolved, resolved_at = :ts, last_updated_at = :ts"
+            ),
+            ConditionExpression=Attr("status").eq("open"),
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={
+                ":s": [_alert_summary(event)],
+                ":resolved": "resolved",
+                ":ts": now_iso,
+            },
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return False
+        raise
+
+    try:
+        _get_window_table().delete_item(
+            Key={"service_key": event["affected_service"]},
+            ConditionExpression=Attr("incident_id").eq(incident_id),
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise  # the window already belongs to a newer incident, or is gone
+    _get_table().delete_item(Key={"fingerprint": fingerprint})
+    return True
+
+
+def _handle_recovery(event: dict, fingerprint: str) -> dict | None:
+    """A resolved alert is not an incident. It closes the open incident it
+    belongs to, or it is dropped (RC1-374)."""
+    incident = _find_open_incident(event)
+    if incident is None:
+        logger.info(
+            "Recovery with no open incident to close, dropping: source=%s alert_name=%s affected_service=%s",
+            event["source"], event["alert_name"], event["affected_service"],
+        )
+        return None
+    incident_id = incident["incident_id"]
+    if not _close_incident(event, incident, fingerprint):
+        logger.info("Incident %s already resolved, dropping duplicate recovery", incident_id)
+        return None
+    logger.info(
+        "Incident resolved: incident_id=%s service=%s by %s alert %s",
+        incident_id, event["affected_service"], event["source"], event["alert_name"],
+    )
+    _lambda_client.invoke(
+        FunctionName=os.environ["SUMMARIZER_FUNCTION_NAME"],
+        InvocationType="Event",
+        Payload=json.dumps({"incident_id": incident_id, "recovered": True}),
+    )
+    return {
+        "incident_id": incident_id,
+        "is_new": False,
+        "resolved": True,
+        "alert_count": len(incident.get("source_alerts", [])) + 1,
+        "alert": event,
+    }
+
+
 def handler(event: dict, context) -> dict | None:
     fingerprint = generate_fingerprint(
         source=event["source"],
         alert_name=event["alert_name"],
         affected_service=event["affected_service"],
     )
+
+    if event.get("status") == "resolved":
+        return _handle_recovery(event, fingerprint)
 
     window_seconds = int(os.environ.get("CORRELATION_WINDOW_MINUTES", "5")) * 60
     now = int(time.time())

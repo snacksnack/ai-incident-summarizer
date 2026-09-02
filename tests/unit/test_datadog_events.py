@@ -292,3 +292,62 @@ class TestApiKeyCaching:
             app.handler({"incident_id": "inc-123"}, None)
             app.handler({"incident_id": "inc-123"}, None)
         assert mock_secrets.get_secret_value.call_count == 1
+
+
+# ── Recovery (RC1-374) ───────────────────────────────────────────────────────
+
+RESOLVED_INCIDENT = {
+    **INCIDENT,
+    "status": "resolved",
+    "resolved_at": "2024-01-15T10:42:30Z",
+    "recovery_summary": json.dumps({
+        "summary": "Payments recovered after 42 minutes.",
+        "likely_cause": "Pool exhaustion.",
+        "next_step": "Raise the pool ceiling.",
+    }),
+}
+
+
+class TestRecovery:
+    def _posted(self, app, incident=RESOLVED_INCIDENT):
+        app._incident_table.get_item.return_value = {"Item": incident}
+        with patch("requests.post", return_value=_mock_dd_response(777)) as mock_post:
+            result = app.handler({"incident_id": "inc-123", "recovered": True}, None)
+        return mock_post.call_args[1]["json"], result
+
+    def test_recovery_event_is_a_success_on_the_same_aggregation_key(self, dd):
+        app, _, _ = dd
+        event, _ = self._posted(app)
+        assert event["title"] == "[RESOLVED] payments-service — incident inc-123"
+        assert event["alert_type"] == "success"
+        assert event["priority"] == "low"
+        assert event["aggregation_key"] == "incident:inc-123"
+
+    def test_recovery_event_carries_recovery_summary_and_duration(self, dd):
+        app, _, _ = dd
+        event, _ = self._posted(app)
+        assert "Payments recovered after 42 minutes." in event["text"]
+        assert "**Resolved:** 2024-01-15T10:42:30Z after 42m 30s" in event["text"]
+        assert INCIDENT["llm_summary"] not in event["text"]
+
+    def test_recovery_event_tags_status_resolved(self, dd):
+        app, _, _ = dd
+        event, _ = self._posted(app)
+        assert "status:resolved" in event["tags"]
+        assert "status:open" not in event["tags"]
+        assert "monitor_id:99999" in event["tags"]
+
+    def test_open_event_tags_status_open(self, dd):
+        app, _, _ = dd
+        assert "status:open" in _posted_event(app)["tags"]
+
+    def test_recovery_event_id_written_back(self, dd):
+        app, mock_table, _ = dd
+        _, result = self._posted(app)
+        assert result["datadog_event_id"] == "777"
+        assert mock_table.update_item.call_args[1]["ExpressionAttributeValues"][":e"] == "777"
+
+    def test_recovery_without_summary_still_posts(self, dd):
+        app, _, _ = dd
+        event, _ = self._posted(app, {k: v for k, v in RESOLVED_INCIDENT.items() if k != "recovery_summary"})
+        assert "Incident resolved" in event["text"]

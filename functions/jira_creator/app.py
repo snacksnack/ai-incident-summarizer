@@ -125,14 +125,60 @@ def _create_jira_ticket(incident: dict) -> str:
     return response.json()["key"]
 
 
-def _invoke_datadog_events(incident_id: str) -> None:
+def _recovery_comment(incident: dict) -> dict:
+    paragraphs = [{"type": "paragraph", "content": [{"type": "text", "text": "Incident resolved.", "marks": [{"type": "strong"}]}]}]
+    try:
+        parsed = json.loads(incident.get("recovery_summary") or "")
+        for label, key in [("Summary", "summary"), ("Likely cause", "likely_cause"), ("Next step", "next_step")]:
+            paragraphs.append({"type": "paragraph", "content": [{"type": "text", "text": f"{label}: {parsed[key]}"}]})
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass
+    if incident.get("resolved_at"):
+        paragraphs.append({"type": "paragraph", "content": [{"type": "text", "text": f"Resolved at: {incident['resolved_at']}"}]})
+    return {"version": 1, "type": "doc", "content": paragraphs}
+
+
+def _close_jira_ticket(incident: dict) -> None:
+    """Comment the recovery on the ticket and move it to a Done-category status
+    if the project's workflow offers one from here. Both best effort: a Jira
+    hiccup must not stop the hand-off to Datadog."""
+    base_url = os.environ["JIRA_BASE_URL"].rstrip("/")
+    auth = HTTPBasicAuth(os.environ["JIRA_USER_EMAIL"], _get_api_token())
+    key = incident["jira_ticket_id"]
+    headers = {"Accept": "application/json"}
+
+    resp = requests.post(f"{base_url}/rest/api/3/issue/{key}/comment", json={"body": _recovery_comment(incident)}, auth=auth, headers=headers, timeout=10)
+    if not resp.ok:
+        logger.error("Jira rejected the recovery comment on %s (%s): %s", key, resp.status_code, resp.text[:300])
+    else:
+        logger.info("Recovery comment posted on %s", key)
+
+    resp = requests.get(f"{base_url}/rest/api/3/issue/{key}/transitions", auth=auth, headers=headers, timeout=10)
+    if not resp.ok:
+        logger.error("Could not list transitions for %s (%s)", key, resp.status_code)
+        return
+    done = next((t for t in resp.json().get("transitions", []) if (t.get("to") or {}).get("statusCategory", {}).get("key") == "done"), None)
+    if done is None:
+        logger.info("No Done-category transition available for %s; left as is", key)
+        return
+    resp = requests.post(f"{base_url}/rest/api/3/issue/{key}/transitions", json={"transition": {"id": done["id"]}}, auth=auth, headers=headers, timeout=10)
+    if resp.ok:
+        logger.info("Transitioned %s to %s", key, done.get("name"))
+    else:
+        logger.error("Jira rejected transition %s on %s (%s): %s", done.get("name"), key, resp.status_code, resp.text[:300])
+
+
+def _invoke_datadog_events(incident_id: str, recovered: bool = False) -> None:
     # Last stop in the delivery chain. Runs whether the ticket was created just
     # now or already existed, so every re-summary of a live incident reaches
     # Datadog's timeline with both the Slack and Jira links in hand.
+    payload = {"incident_id": incident_id}
+    if recovered:
+        payload["recovered"] = True
     _lambda_client.invoke(
         FunctionName=os.environ["DATADOG_EVENTS_FUNCTION_NAME"],
         InvocationType="Event",
-        Payload=json.dumps({"incident_id": incident_id}),
+        Payload=json.dumps(payload),
     )
     logger.info("Datadog events writer invoked for incident %s", incident_id)
 
@@ -149,6 +195,14 @@ def handler(event: dict, context) -> dict | None:
     if not incident:
         logger.warning("Incident %s not found", incident_id)
         return None
+
+    if event.get("recovered"):
+        if incident.get("jira_ticket_id"):
+            _close_jira_ticket(incident)
+        else:
+            logger.info("Incident %s resolved with no Jira ticket to close", incident_id)
+        _invoke_datadog_events(incident_id, recovered=True)
+        return {"incident_id": incident_id, "jira_ticket_id": incident.get("jira_ticket_id"), "resolved": True}
 
     if incident.get("jira_ticket_id"):
         logger.info("Incident %s already has jira_ticket_id %s, skipping", incident_id, incident["jira_ticket_id"])
