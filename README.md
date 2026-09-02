@@ -211,6 +211,12 @@ DD_API_KEY=… DD_APP_KEY=… python scripts/configure_datadog_webhook.py
 
 To notify the pipeline, add `@webhook-incident-summarizer` to a monitor's message. Monitor **318762066** ("incident-summarizer webhook test signal") exists for exactly that: push `incident_summarizer.test_signal` = 1 to trigger it, 0 to recover.
 
+**Which real monitors notify it.** `scripts/wire_datadog_monitors.py` is the source of truth (RC1-375): eight monitors that mean a real outage and rarely flap — the five synthetics checks on www.hihelloreid.com and incidents.hihelloreid.com (uptime, /work render, TLS expiry), the two CI Visibility monitors (production deploy failed, CI pipeline failed) and the daily LLM spend guardrail. Each gets the webhook handle appended to its message, a `service:` tag (`hihelloreid.com`, `incidents.hihelloreid.com`, `delivery-pipeline`, `agent-fleet`) so the incident is filed under a service rather than `unknown`, and a priority (P2 for the two uptime checks and the deploy monitor, P3 for the rest), since `$ALERT_PRIORITY` sets incident severity. The six Program KPI monitors and the seven host-pack monitors are deliberately left out — the KPI sim keeps a monitor tripped by script for weeks, and each alert would be a Slack post, an INC ticket and a model call. Synthetics-backed monitors reject monitor-API edits, so the script writes their message, tags and priority to the synthetics test instead. Re-run it after a monitor is recreated or edited by hand; it changes nothing that already matches:
+
+```bash
+DD_API_KEY=… DD_APP_KEY=… python scripts/wire_datadog_monitors.py --dry-run   # then without --dry-run
+```
+
 ---
 
 ## Key design decisions
