@@ -37,6 +37,10 @@ Parameters:
     Type: String
     Description: Deployment environment for Datadog tagging (dev / staging / prod)
     Default: dev
+  IncidentDashboardUrl:
+    Type: String
+    Description: Base URL of the incident history UI, linked from Datadog events (empty to omit the link)
+    Default: https://incidents.hihelloreid.com
 
 Globals:
   Function:
@@ -345,6 +349,7 @@ Resources:
           JIRA_PROJECT_KEY: !Ref JiraProjectKey
           JIRA_USER_EMAIL: !Ref JiraUserEmail
           SLACK_CHANNEL_ID: !Ref SlackChannelId
+          DATADOG_EVENTS_FUNCTION_NAME: !Ref DatadogEventsFunction
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref IncidentTable
@@ -354,6 +359,38 @@ Resources:
               Resource:
                 - !Ref JiraApiTokenSecretArn
                 - !Ref DatadogApiKeySecretArn
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt DatadogEventsFunction.Arn
+
+  # ── Datadog events writer ────────────────────────────────────────────────────
+  # Closes the loop: the summary that came out of Datadog's alerts goes back in
+  # as an event, so the timeline shows the LLM summary beside the raw monitors.
+  # Reuses the extension's API key secret — Datadog API keys carry no scopes.
+
+  DatadogEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/datadog_events/
+      Description: Posts incident summaries to the Datadog Events API and writes the event ID back to DynamoDB
+      Layers:
+        - !Ref CommonLayer
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+      Environment:
+        Variables:
+          INCIDENT_TABLE_NAME: !Ref IncidentTable
+          SLACK_CHANNEL_ID: !Ref SlackChannelId
+          JIRA_BASE_URL: !Ref JiraBaseUrl
+          INCIDENT_DASHBOARD_URL: !Ref IncidentDashboardUrl
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref DatadogApiKeySecretArn
 
   # ── CloudWatch → EventBridge path ──────────────────────────────────────────
 

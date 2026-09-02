@@ -10,6 +10,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 _secrets_client = boto3.client("secretsmanager")
+_lambda_client = boto3.client("lambda")
 _dynamodb = boto3.resource("dynamodb")
 _incident_table = None
 _token_cache: dict[str, str] = {}
@@ -111,6 +112,18 @@ def _create_jira_ticket(incident: dict) -> str:
     return response.json()["key"]
 
 
+def _invoke_datadog_events(incident_id: str) -> None:
+    # Last stop in the delivery chain. Runs whether the ticket was created just
+    # now or already existed, so every re-summary of a live incident reaches
+    # Datadog's timeline with both the Slack and Jira links in hand.
+    _lambda_client.invoke(
+        FunctionName=os.environ["DATADOG_EVENTS_FUNCTION_NAME"],
+        InvocationType="Event",
+        Payload=json.dumps({"incident_id": incident_id}),
+    )
+    logger.info("Datadog events writer invoked for incident %s", incident_id)
+
+
 def handler(event: dict, context) -> dict | None:
     incident_id = event.get("incident_id")
     if not incident_id:
@@ -126,6 +139,7 @@ def handler(event: dict, context) -> dict | None:
 
     if incident.get("jira_ticket_id"):
         logger.info("Incident %s already has jira_ticket_id %s, skipping", incident_id, incident["jira_ticket_id"])
+        _invoke_datadog_events(incident_id)
         return {"incident_id": incident_id, "jira_ticket_id": incident["jira_ticket_id"]}
 
     ticket_key = _create_jira_ticket(incident)
@@ -135,4 +149,5 @@ def handler(event: dict, context) -> dict | None:
         ExpressionAttributeValues={":k": ticket_key},
     )
     logger.info("Jira ticket %s created for incident %s", ticket_key, incident_id)
+    _invoke_datadog_events(incident_id)
     return {"incident_id": incident_id, "jira_ticket_id": ticket_key}

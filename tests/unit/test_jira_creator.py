@@ -13,6 +13,7 @@ JIRA_BASE_URL = "https://hirereidcollins.atlassian.net"
 JIRA_PROJECT_KEY = "INC"
 JIRA_USER_EMAIL = "hire.reid.collins@gmail.com"
 SLACK_CHANNEL_ID = "C0B4L4L5H4J"
+DATADOG_EVENTS_FUNCTION = "test-datadog-events"
 
 INCIDENT = {
     "incident_id": "inc-123",
@@ -62,6 +63,7 @@ def jira(monkeypatch):
     monkeypatch.setenv("JIRA_PROJECT_KEY", JIRA_PROJECT_KEY)
     monkeypatch.setenv("JIRA_USER_EMAIL", JIRA_USER_EMAIL)
     monkeypatch.setenv("SLACK_CHANNEL_ID", SLACK_CHANNEL_ID)
+    monkeypatch.setenv("DATADOG_EVENTS_FUNCTION_NAME", DATADOG_EVENTS_FUNCTION)
 
     mock_table = MagicMock()
     mock_table.get_item.return_value = {"Item": INCIDENT_NO_JIRA}
@@ -74,6 +76,7 @@ def jira(monkeypatch):
         app = _load_jira_creator()
         app._incident_table = mock_table
         app._secrets_client = mock_secrets
+        app._lambda_client = MagicMock()
         app._token_cache.clear()
         yield app, mock_table, mock_secrets
 
@@ -126,6 +129,45 @@ class TestHandler:
         with patch("requests.post", return_value=mock_response):
             with pytest.raises(requests.HTTPError):
                 app.handler({"incident_id": "inc-123"}, None)
+
+
+# ── Delivery chain ────────────────────────────────────────────────────────────
+
+class TestDatadogHandoff:
+    def _invoke_payload(self, app):
+        app._lambda_client.invoke.assert_called_once()
+        kwargs = app._lambda_client.invoke.call_args[1]
+        assert kwargs["FunctionName"] == DATADOG_EVENTS_FUNCTION
+        assert kwargs["InvocationType"] == "Event"
+        return json.loads(kwargs["Payload"])
+
+    def test_invokes_datadog_events_after_creating_ticket(self, jira):
+        app, _, _ = jira
+        with patch("requests.post", return_value=_mock_jira_response("INC-7")):
+            app.handler({"incident_id": "inc-123"}, None)
+        assert self._invoke_payload(app) == {"incident_id": "inc-123"}
+
+    def test_invokes_datadog_events_when_ticket_already_exists(self, jira):
+        app, mock_table, _ = jira
+        mock_table.get_item.return_value = {"Item": INCIDENT_WITH_JIRA}
+        with patch("requests.post", return_value=_mock_jira_response()):
+            app.handler({"incident_id": "inc-123"}, None)
+        assert self._invoke_payload(app) == {"incident_id": "inc-123"}
+
+    def test_does_not_invoke_when_ticket_creation_fails(self, jira):
+        app, _, _ = jira
+        mock_response = MagicMock()
+        mock_response.raise_for_status.side_effect = requests.HTTPError("500 Server Error")
+        with patch("requests.post", return_value=mock_response):
+            with pytest.raises(requests.HTTPError):
+                app.handler({"incident_id": "inc-123"}, None)
+        app._lambda_client.invoke.assert_not_called()
+
+    def test_does_not_invoke_when_incident_missing(self, jira):
+        app, mock_table, _ = jira
+        mock_table.get_item.return_value = {}
+        app.handler({"incident_id": "nonexistent"}, None)
+        app._lambda_client.invoke.assert_not_called()
 
 
 # ── Jira API call ─────────────────────────────────────────────────────────────

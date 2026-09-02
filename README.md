@@ -1,6 +1,6 @@
 # ai-incident-summarizer
 
-An AI-powered incident summarization system that ingests alerts from multiple observability sources, deduplicates and correlates them, summarizes incidents using an LLM, and delivers operational summaries to Slack and Jira.
+An AI-powered incident summarization system that ingests alerts from multiple observability sources, deduplicates and correlates them, summarizes incidents using an LLM, and delivers operational summaries to Slack, Jira, and back into Datadog's event timeline.
 
 Built with AWS Lambda (Python), SAM, DynamoDB, Claude, Next.js, and Vercel.
 
@@ -42,8 +42,11 @@ EventBridge        API Gateway (HMAC validation)
     DynamoDB      LLM summarizer
     (persist      (Claude / GPT-4o)
     raw incident) │
-        ▲         ├──► Slack  ──► write back thread_id
-        │         └──► Jira   ──► write back ticket_id
+        ▲         ├──► Slack    ──► write back thread_id
+        │         ├──► Jira     ──► write back ticket_id
+        │         └──► Datadog  ──► write back event_id
+        │              (Events API — the summary lands on the
+        │               timeline beside the monitors that fed it)
         │
         ▼
   Incident history UI
@@ -61,6 +64,7 @@ EventBridge        API Gateway (HMAC validation)
 | `llm_summary` | LLM-generated summary |
 | `slack_thread_id` | Enables Slack reply threading |
 | `jira_ticket_id` | Linked Jira ticket |
+| `datadog_event_id` | Latest Datadog event posted for this incident (all its events share `aggregation_key` `incident:<id>`) |
 | `created_at` | ISO timestamp |
 | `ttl` | Optional expiry timestamp. TTL is enabled on the table, so any incident carrying this attribute is deleted by DynamoDB once it passes. Neither the pipeline nor the seed script sets it — omit it unless you want the incident to disappear. |
 
@@ -94,7 +98,10 @@ ai-incident-summarizer/
 │   ├── slack/                 # Slack delivery
 │   │   ├── app.py
 │   │   └── requirements.txt
-│   └── jira/                  # Jira ticket creation
+│   ├── jira/                  # Jira ticket creation
+│   │   ├── app.py
+│   │   └── requirements.txt
+│   └── datadog_events/        # Datadog Events API write-back
 │       ├── app.py
 │       └── requirements.txt
 ├── layers/
@@ -132,6 +139,7 @@ ai-incident-summarizer/
 | `JIRA_API_TOKEN_SECRET_ARN` | Secrets Manager ARN for Jira API token |
 | `JIRA_BASE_URL` | Your Jira instance URL |
 | `JIRA_PROJECT_KEY` | Jira project key for incident tickets |
+| `INCIDENT_DASHBOARD_URL` | Base URL of the incident history UI, linked from Datadog events (empty omits the link) |
 | `LLM_PROVIDER` | `claude` or `openai` |
 | `CORRELATION_WINDOW_MINUTES` | Alert grouping window in minutes (default: 5) |
 
@@ -200,6 +208,7 @@ aws cloudformation describe-stacks --stack-name ai-incident-summarizer \
 | Secret management | AWS Secrets Manager | API keys never stored in plain text or env vars |
 | Deployment | AWS SAM | Native AWS tooling, infrastructure-as-code |
 | Observability | Datadog Lambda layer | APM traces, logs, and metrics auto-instrumented |
+| Datadog write-back | Events API v1, last stop in the delivery chain | The chain is summarizer → Slack → Jira → Datadog so the event carries both links. Each stage is idempotent about its own artifact (thread, ticket) and always hands off, so a re-summary of a live incident reaches the timeline too; `aggregation_key` rolls those up under one row. Reuses the Lambda extension's API key secret — Datadog API keys carry no scopes, so there is no narrower key to mint. |
 | Incident history UI | Next.js on Vercel | Next.js API routes call DynamoDB directly as Vercel serverless functions — no API Gateway needed. A single `vercel deploy` produces a shareable URL. React handles the dashboard UI. Chosen over a static S3 + API Gateway approach for simplicity and to gain practical exposure to Vercel, which is widely used in the industry. |
 
 ---
@@ -208,6 +217,9 @@ aws cloudformation describe-stacks --stack-name ai-incident-summarizer \
 
 **Datadog webhook signature verification**
 Datadog's webhook integration does not support HMAC payload signing natively, unlike GitHub Actions which uses `X-Hub-Signature-256`. Instead, a shared secret is passed via a custom `X-Webhook-Secret` header configured in the Datadog webhook settings and stored in AWS Secrets Manager. The receiver validates the header value using a timing-safe comparison. This is Datadog's recommended approach for webhook authentication.
+
+**Monitor correlation on the written-back event**
+The Datadog webhook is configured with Datadog's default payload template (`$ID`, `$EVENT_TITLE`, `$EVENT_MSG`, `$DATE`, org), which carries no `$ALERT_ID` (the monitor id), no `$TAGS`, and no `$PRIORITY`. The write-back event therefore correlates to the originating monitor by the `service:` tag it shares with the monitor's own events plus an `alert_id:` tag per Datadog-sourced alert (the id of the monitor event that opened the incident), not by a `monitor_id:` tag. Adding `$ALERT_ID`, `$TAGS`, `$PRIORITY`, `$ALERT_TYPE`, `$ALERT_TRANSITION` and `$LINK` to the webhook payload template would let the normalizer set service and severity from the monitor and let the event carry the monitor id — a webhook-config change, tracked separately.
 
 ---
 
