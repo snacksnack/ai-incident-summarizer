@@ -5,6 +5,8 @@ import os
 import anthropic
 import boto3
 
+from common.duration import incident_duration
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -56,19 +58,55 @@ Respond with a JSON object containing exactly these three fields:
 Return only the JSON object. Do not include markdown, code fences, or any other text."""
 
 
-def _call_llm(incident: dict) -> dict:
+def _build_recovery_prompt(incident: dict) -> str:
+    alerts = incident.get("source_alerts", [])
+    alert_lines = "\n".join(f"- {a['alert_name']} ({a['source']}, {a.get('status', '?')}) at {a.get('received_at', '?')}" for a in alerts)
+    duration = incident_duration(incident) or "unknown"
+    original = incident.get("llm_summary") or "(none)"
+
+    return f"""You are an on-call engineer assistant. This incident has just RECOVERED. Write the closing note.
+
+Incident:
+- Affected service: {incident["affected_service"]}
+- Severity while open: {incident["severity"]}
+- Opened: {incident.get("created_at", "unknown")}
+- Resolved: {incident.get("resolved_at", "unknown")}
+- Duration: {duration}
+- Alert timeline:
+{alert_lines}
+- Summary written while it was open: {original}
+
+Respond with a JSON object containing exactly these three fields:
+{{
+  "summary": "One concise paragraph: what happened, for how long, and that it has recovered",
+  "likely_cause": "The most probable root cause, revised in light of the recovery",
+  "next_step": "The single most useful follow-up now that it is over (a fix, a check, or a post-incident action)"
+}}
+
+Return only the JSON object. Do not include markdown, code fences, or any other text."""
+
+
+def _call_llm(incident: dict, recovered: bool = False) -> dict:
     client = anthropic.Anthropic(api_key=_get_api_key())
+    prompt = _build_recovery_prompt(incident) if recovered else _build_prompt(incident)
     message = client.messages.create(
         model=os.environ["MODEL_ID"],
         max_tokens=1024,
-        messages=[{"role": "user", "content": _build_prompt(incident)}],
+        messages=[{"role": "user", "content": prompt}],
     )
     return json.loads(message.content[0].text)
 
 
-def _fallback_summary(incident: dict) -> dict:
+def _fallback_summary(incident: dict, recovered: bool = False) -> dict:
     alerts = incident.get("source_alerts", [])
     service = incident.get("affected_service", "unknown")
+    if recovered:
+        duration = incident_duration(incident)
+        return {
+            "summary": f"{service} recovered after {duration or 'an unknown duration'} ({len(alerts)} alert(s)). Automated summarization unavailable.",
+            "likely_cause": "Unable to determine — LLM summarization failed.",
+            "next_step": "Review the incident timeline manually.",
+        }
     return {
         "summary": f"{len(alerts)} alert(s) triggered for {service}. Automated summarization unavailable.",
         "likely_cause": "Unable to determine — LLM summarization failed.",
@@ -88,26 +126,37 @@ def handler(event: dict, context) -> dict | None:
         logger.error("Incident %s not found in DynamoDB", incident_id)
         return None
 
+    recovered = bool(event.get("recovered"))
+    field = "recovery_summary" if recovered else "llm_summary"
+
     try:
-        structured = _call_llm(incident)
+        structured = _call_llm(incident, recovered=recovered)
         llm_summary = json.dumps(structured)
-        logger.info("LLM summary generated for incident %s", incident_id)
+        logger.info("LLM %s generated for incident %s", field, incident_id)
     except Exception:
         logger.exception("LLM summarization failed for incident %s, using fallback", incident_id)
-        llm_summary = json.dumps(_fallback_summary(incident))
+        llm_summary = json.dumps(_fallback_summary(incident, recovered=recovered))
 
     _get_incident_table().update_item(
         Key={"incident_id": incident_id},
-        UpdateExpression="SET llm_summary = :s",
+        UpdateExpression=f"SET {field} = :s",
         ExpressionAttributeValues={":s": llm_summary},
     )
-    logger.info("llm_summary written to DynamoDB for incident %s", incident_id)
+    logger.info("%s written to DynamoDB for incident %s", field, incident_id)
 
     _lambda_client.invoke(
         FunctionName=os.environ["SLACK_NOTIFIER_FUNCTION_NAME"],
         InvocationType="Event",
-        Payload=json.dumps({"incident_id": incident_id}),
+        Payload=json.dumps(_handoff(incident_id, recovered)),
     )
     logger.info("Slack notifier invoked for incident %s", incident_id)
 
-    return {"incident_id": incident_id, "llm_summary": llm_summary}
+    return {"incident_id": incident_id, field: llm_summary}
+
+
+def _handoff(incident_id: str, recovered: bool) -> dict:
+    # The flag rides the whole delivery chain; absent means the usual open-incident rendering.
+    payload = {"incident_id": incident_id}
+    if recovered:
+        payload["recovered"] = True
+    return payload

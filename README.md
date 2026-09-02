@@ -14,7 +14,7 @@ Built with AWS Lambda (Python), SAM, DynamoDB, Claude, Next.js, and Vercel.
 |---|---|---|
 | **CloudWatch** | AWS infrastructure alarms (Lambda errors, timeouts, throttles) | Native EventBridge |
 | **Datadog** | APM and application-level alerts (error rates, latency, service health) | Webhook via API Gateway |
-| **GitHub Actions** | CI/CD pipeline failures — only `workflow_run.completed` events whose conclusion is not success; in-progress runs, successes, `workflow_job` and `push` deliveries are ignored | Webhook via API Gateway |
+| **GitHub Actions** | CI/CD pipeline failures — only `workflow_run.completed` events; a failed run opens an incident, a successful one is a recovery that closes it; in-progress runs, `workflow_job` and `push` deliveries are ignored | Webhook via API Gateway |
 
 ---
 
@@ -35,6 +35,8 @@ EventBridge        API Gateway (HMAC validation)
     ┌─── Dedup + correlation ────────────────┐
     │  Fingerprinting → Time-window grouping │
     │  State store: DynamoDB TTL             │
+    │  Recovery → closes the open incident   │
+    │  (or is dropped if there is none)      │
     └────────────────────────────────────────┘
                │
         ┌──────┴──────┐
@@ -60,8 +62,10 @@ EventBridge        API Gateway (HMAC validation)
 | `source_alerts[]` | Per-alert summaries (id, source, name, severity, status, received_at; `monitor_id` for Datadog alerts) |
 | `affected_service` | Service name |
 | `severity` | critical / high / medium / low |
-| `status` | open / acknowledged / resolved |
-| `llm_summary` | LLM-generated summary |
+| `status` | open / acknowledged / resolved — set to `resolved` by the recovery of an alert the incident holds (CloudWatch OK, Datadog Recovered, GitHub success) |
+| `resolved_at` | ISO timestamp of the recovery |
+| `recovery_summary` | LLM-generated closing note (same three fields as `llm_summary`) |
+| `llm_summary` | LLM-generated summary while open |
 | `slack_thread_id` | Enables Slack reply threading |
 | `jira_ticket_id` | Linked Jira ticket |
 | `datadog_event_id` | Latest Datadog event posted for this incident (all its events share `aggregation_key` `incident:<id>`) |
@@ -218,15 +222,13 @@ To notify the pipeline, add `@webhook-incident-summarizer` to a monitor's messag
 | Secret management | AWS Secrets Manager | API keys never stored in plain text or env vars |
 | Deployment | AWS SAM | Native AWS tooling, infrastructure-as-code |
 | Observability | Datadog Lambda layer | APM traces, logs, and metrics auto-instrumented |
+| Recoveries | Close, never open | A resolved alert (CloudWatch OK, Datadog Recovered, GitHub success) closes the newest open incident for that service holding the same alert, retires the window and fingerprint rows so the next alert starts fresh, and runs the delivery chain once more with a `recovered` flag: Slack reply in the thread, Jira comment plus a Done-category transition when the workflow offers one, Datadog `success` event on the same aggregation key. A recovery with nothing to close is dropped. |
 | Datadog write-back | Events API v1, last stop in the delivery chain | The chain is summarizer → Slack → Jira → Datadog so the event carries both links. Each stage is idempotent about its own artifact (thread, ticket) and always hands off, so a re-summary of a live incident reaches the timeline too; `aggregation_key` rolls those up under one row. Reuses the Lambda extension's API key secret — Datadog API keys carry no scopes, so there is no narrower key to mint. |
 | Incident history UI | Next.js on Vercel | Next.js API routes call DynamoDB directly as Vercel serverless functions — no API Gateway needed. A single `vercel deploy` produces a shareable URL. React handles the dashboard UI. Chosen over a static S3 + API Gateway approach for simplicity and to gain practical exposure to Vercel, which is widely used in the industry. |
 
 ---
 
 ## Known limitations
-
-**Recoveries do not close incidents**
-Every alert the normalizer emits opens or extends an incident, including ones that mean "it recovered": a CloudWatch alarm returning to OK, a Datadog monitor's Recovered transition. The GitHub path drops successful runs outright (RC1-373); the other two still open a low-severity incident on recovery. Closing the matching open incident instead is a follow-up.
 
 
 **Datadog webhook signature verification**

@@ -5,6 +5,8 @@ import os
 import boto3
 import requests
 
+from common.duration import incident_duration
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -52,8 +54,8 @@ def _events_url() -> str:
     return f"https://api.{site}/api/v1/events"
 
 
-def _parsed_summary(incident: dict) -> dict | None:
-    llm_summary = incident.get("llm_summary")
+def _parsed_summary(incident: dict, field: str = "llm_summary") -> dict | None:
+    llm_summary = incident.get(field)
     if not llm_summary:
         return None
     try:
@@ -82,17 +84,22 @@ def _links(incident: dict) -> list[tuple[str, str]]:
     return links
 
 
-def _build_text(incident: dict) -> str:
+def _build_text(incident: dict, recovered: bool = False) -> str:
     parts = []
-    parsed = _parsed_summary(incident)
+    parsed = _parsed_summary(incident, "recovery_summary" if recovered else "llm_summary")
     if parsed:
         parts.append(
             f"**Summary:** {parsed['summary']}\n\n"
             f"**Likely cause:** {parsed['likely_cause']}\n\n"
             f"**Next step:** {parsed['next_step']}"
         )
+    elif recovered:
+        parts.append("_Incident resolved; no recovery summary available._")
     else:
         parts.append("_No LLM summary available._")
+    if recovered:
+        duration = incident_duration(incident)
+        parts.append(f"**Resolved:** {incident.get('resolved_at', 'unknown')}" + (f" after {duration}" if duration else ""))
 
     alerts = incident.get("source_alerts", [])
     if alerts:
@@ -113,12 +120,13 @@ def _build_text(incident: dict) -> str:
     return frame.format(body)
 
 
-def _build_tags(incident: dict) -> list[str]:
+def _build_tags(incident: dict, recovered: bool = False) -> list[str]:
     severity = incident.get("severity", "").lower()
     tags = [
         f"incident_id:{incident['incident_id']}",
         f"service:{incident['affected_service']}",
         f"severity:{severity}",
+        f"status:{'resolved' if recovered else 'open'}",
         "source:incident-summarizer",
         "kind:incident-summary",
     ]
@@ -140,17 +148,19 @@ def _build_tags(incident: dict) -> list[str]:
     return tags
 
 
-def _build_event(incident: dict) -> dict:
+def _build_event(incident: dict, recovered: bool = False) -> dict:
     severity = incident.get("severity", "").lower()
+    label = "RESOLVED" if recovered else severity.upper()
     return {
-        "title": f"[{severity.upper()}] {incident['affected_service']} — incident {incident['incident_id']}",
-        "text": _build_text(incident),
-        "alert_type": _ALERT_TYPE.get(severity, "info"),
-        "priority": _PRIORITY.get(severity, "low"),
-        # One incident, one row in the timeline: every re-summary of the same
-        # incident rolls up under it instead of posting a look-alike.
+        "title": f"[{label}] {incident['affected_service']} — incident {incident['incident_id']}",
+        "text": _build_text(incident, recovered),
+        "alert_type": "success" if recovered else _ALERT_TYPE.get(severity, "info"),
+        "priority": "low" if recovered else _PRIORITY.get(severity, "low"),
+        # One incident, one row in the timeline: every re-summary and the
+        # recovery of the same incident roll up under it instead of posting a
+        # look-alike.
         "aggregation_key": f"incident:{incident['incident_id']}",
-        "tags": _build_tags(incident),
+        "tags": _build_tags(incident, recovered),
     }
 
 
@@ -178,7 +188,7 @@ def handler(event: dict, context) -> dict | None:
         logger.warning("Incident %s not found", incident_id)
         return None
 
-    event_id = _post_event(_build_event(incident))
+    event_id = _post_event(_build_event(incident, recovered=bool(event.get("recovered"))))
     table.update_item(
         Key={"incident_id": incident_id},
         UpdateExpression="SET datadog_event_id = :e",

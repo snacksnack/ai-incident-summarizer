@@ -7,6 +7,8 @@ import boto3
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+from common.duration import incident_duration
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -64,6 +66,26 @@ def _build_message(incident: dict) -> str:
     return f"{header}\n\n{body}"
 
 
+def _build_recovery_message(incident: dict) -> str:
+    service = incident["affected_service"]
+    duration = incident_duration(incident)
+    header = f"🟢 *RESOLVED* | {service} | {incident.get('resolved_at', 'unknown')}"
+    if duration:
+        header += f" | open for {duration}"
+
+    try:
+        parsed = json.loads(incident.get("recovery_summary") or "")
+        body = (
+            f"*Summary:* {parsed['summary']}\n"
+            f"*Likely cause:* {parsed['likely_cause']}\n"
+            f"*Next step:* {parsed['next_step']}"
+        )
+    except (json.JSONDecodeError, KeyError, TypeError):
+        body = "Incident resolved.\n" + _raw_alert_list(incident)
+
+    return f"{header}\n\n{body}"
+
+
 def _raw_alert_list(incident: dict) -> str:
     alerts = incident.get("source_alerts", [])
     if not alerts:
@@ -88,14 +110,17 @@ def _post_with_retry(client: WebClient, **kwargs) -> dict:
             time.sleep(delay)
 
 
-def _invoke_jira_creator(incident_id: str) -> None:
+def _invoke_jira_creator(incident_id: str, recovered: bool = False) -> None:
     # Next stop in the delivery chain on both paths. The Jira creator is
     # idempotent about its ticket and hands off to the Datadog events writer,
     # so a reply in an existing thread still reaches the Datadog timeline.
+    payload = {"incident_id": incident_id}
+    if recovered:
+        payload["recovered"] = True
     _lambda_client.invoke(
         FunctionName=os.environ["JIRA_CREATOR_FUNCTION_NAME"],
         InvocationType="Event",
-        Payload=json.dumps({"incident_id": incident_id}),
+        Payload=json.dumps(payload),
     )
     logger.info("Jira creator invoked for incident %s", incident_id)
 
@@ -115,13 +140,14 @@ def handler(event: dict, context) -> dict | None:
 
     channel = os.environ["SLACK_CHANNEL_ID"]
     client = WebClient(token=_get_token())
-    text = _build_message(incident)
+    recovered = bool(event.get("recovered"))
+    text = _build_recovery_message(incident) if recovered else _build_message(incident)
     slack_thread_id = incident.get("slack_thread_id")
 
     if slack_thread_id:
         _post_with_retry(client, channel=channel, text=text, thread_ts=slack_thread_id)
-        logger.info("Posted reply to thread %s for incident %s", slack_thread_id, incident_id)
-        _invoke_jira_creator(incident_id)
+        logger.info("Posted %s to thread %s for incident %s", "recovery" if recovered else "reply", slack_thread_id, incident_id)
+        _invoke_jira_creator(incident_id, recovered)
         return {"incident_id": incident_id, "slack_thread_id": slack_thread_id}
 
     result = _post_with_retry(client, channel=channel, text=text)
@@ -133,5 +159,5 @@ def handler(event: dict, context) -> dict | None:
     )
     logger.info("Opened new thread %s for incident %s", thread_ts, incident_id)
 
-    _invoke_jira_creator(incident_id)
+    _invoke_jira_creator(incident_id, recovered)
     return {"incident_id": incident_id, "slack_thread_id": thread_ts}

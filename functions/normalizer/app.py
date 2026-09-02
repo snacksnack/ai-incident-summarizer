@@ -22,11 +22,12 @@ _DD_RESOLVED_TRANSITIONS = {"Recovered"}
 # ("[Triggered on {service:x}] Error rate"); the fingerprint must not.
 _DD_TITLE_PREFIX = re.compile(r"^(\[[^\]]*\]\s*)+")
 
-# A run is an alert only once it has completed and not succeeded. Anything
-# else — in_progress / requested runs (no conclusion yet), workflow_job and
-# push events, successful runs — is not an incident (RC1-373: every deploy
-# start used to open a HIGH incident because a missing conclusion defaulted
-# to "failure", and the success 55 s later was deduped away).
+# A run is an alert only once it has completed. in_progress / requested runs
+# (no conclusion yet), workflow_job and push events are ignored (RC1-373: every
+# deploy start used to open a HIGH incident because a missing conclusion
+# defaulted to "failure"). A successful run is a *recovery*: dedup closes the
+# open incident for that workflow if there is one, and drops it otherwise
+# (RC1-374).
 _GH_SUCCESS_CONCLUSIONS = {"success", "skipped", "neutral"}
 _GH_SEVERITY_MAP = {"failure": "high", "timed_out": "high", "startup_failure": "high", "cancelled": "medium"}
 
@@ -167,17 +168,15 @@ def _normalize_github(envelope: dict) -> NormalizedAlert | None:
 
     run = payload["workflow_run"]
     conclusion = run.get("conclusion")
-    if conclusion in _GH_SUCCESS_CONCLUSIONS:
-        logger.info("Ignoring successful github workflow run %r (%s)", run.get("name"), conclusion)
-        return None
     if not conclusion:
         logger.warning("Ignoring completed github workflow run %r with no conclusion", run.get("name"))
         return None
 
-    # Any other conclusion (failure, timed_out, cancelled, startup_failure,
-    # action_required, stale, …) is a run that did not succeed.
-    severity = _GH_SEVERITY_MAP.get(conclusion, "medium")
-    status = "open"
+    if conclusion in _GH_SUCCESS_CONCLUSIONS:
+        severity, status = "low", "resolved"
+    else:
+        # failure, timed_out, cancelled, startup_failure, action_required, stale, …
+        severity, status = _GH_SEVERITY_MAP.get(conclusion, "medium"), "open"
 
     return NormalizedAlert(
         alert_id=str(run["id"]),
