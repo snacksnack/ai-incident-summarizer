@@ -5,6 +5,7 @@ export interface SourceAlert {
   severity: string;
   status: string;
   received_at: string;
+  monitor_id?: string;
 }
 
 export interface LlmSummary {

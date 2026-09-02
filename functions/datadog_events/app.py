@@ -127,12 +127,16 @@ def _build_tags(incident: dict) -> list[str]:
         tags.append(f"env:{env}")
     if incident.get("jira_ticket_id"):
         tags.append(f"jira_ticket:{incident['jira_ticket_id']}")
-    # The Datadog-sourced alerts' ids are the ids of the monitor events that
-    # opened this incident — the handle back to the originating monitor's row
-    # in the same event stream this summary lands in.
+    # For Datadog-sourced alerts: alert_id is the monitor *event* that opened
+    # this incident (a row in the same stream this summary lands in), and
+    # monitor_id is the monitor itself, stable across trigger and recovery.
     for alert in incident.get("source_alerts", []):
-        if alert.get("source") == "datadog" and alert.get("alert_id"):
+        if alert.get("source") != "datadog":
+            continue
+        if alert.get("alert_id"):
             tags.append(f"alert_id:{alert['alert_id']}")
+        if alert.get("monitor_id"):
+            tags.append(f"monitor_id:{alert['monitor_id']}")
     return tags
 
 

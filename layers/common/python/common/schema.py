@@ -12,6 +12,7 @@ class NormalizedAlert:
     status: Literal["open", "resolved"]
     raw_payload: dict
     received_at: str  # ISO 8601
+    monitor_id: str | None = None  # Datadog only: the alerting monitor ($ALERT_ID), stable across transitions
 
     def to_dict(self) -> dict:
         return asdict(self)

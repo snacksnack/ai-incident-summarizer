@@ -10,5 +10,5 @@
     "x-datadog-signature": "REPLACE_WITH_VALID_SIGNATURE"
   },
   "isBase64Encoded": false,
-  "body": "{\"id\":\"abc-123-def\",\"title\":\"Error rate above threshold\",\"msg\":\"Error rate for payments-service exceeded 5% over the last 5 minutes.\",\"priority\":\"P1\",\"alert_type\":\"error\",\"date_happened\":1705312200,\"org\":{\"id\":12345,\"name\":\"my-org\"},\"tags\":[\"service:payments-service\",\"env:production\",\"team:backend\"],\"url\":\"https://app.datadoghq.com/monitors/99999\",\"alert_transition\":\"Triggered\"}"
+  "body": "{\"id\": \"8793100000000000001\", \"alert_id\": \"99999\", \"alert_cycle_key\": \"1705312200\", \"title\": \"[Triggered on {service:payments-service}] Error rate above threshold\", \"event_title\": \"[Triggered] Error rate above threshold\", \"body\": \"Error rate for payments-service exceeded 5% over the last 5 minutes.\", \"priority\": \"P1\", \"alert_type\": \"error\", \"alert_transition\": \"Triggered\", \"tags\": \"service:payments-service,env:production,team:backend\", \"url\": \"https://app.datadoghq.com/event/jump_to?event_id=8793100000000000001\", \"date\": \"1705312200\", \"last_updated\": \"1705312200\", \"event_type\": \"query_alert_monitor\", \"org\": {\"id\": \"12345\", \"name\": \"my-org\"}}"
 }
