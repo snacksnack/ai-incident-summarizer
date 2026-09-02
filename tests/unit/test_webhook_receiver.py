@@ -200,3 +200,37 @@ class TestStagePrefix:
         with caplog.at_level("WARNING"):
             app.handler(_make_event("/prod/webhook/nope", "{}", {}), None)
         assert "unknown path" in caplog.text
+
+
+class TestSecretShape:
+    """RC1-370: the stored secrets are one-key JSON objects; the bare value is what
+    GitHub signs with and Datadog sends."""
+
+    def test_json_wrapped_datadog_secret_matches_bare_header(self, mock_aws, monkeypatch):
+        app, _, mock_secrets = mock_aws
+        app._secret_cache.clear()
+        mock_secrets.get_secret_value.side_effect = None
+        mock_secrets.get_secret_value.return_value = {"SecretString": json.dumps({"dd-webhook-secret": DATADOG_SECRET})}
+        event = _make_event("/webhook/datadog", DATADOG_BODY, {"x-webhook-secret": DATADOG_SECRET})
+        assert app.handler(event, None)["statusCode"] == 202
+
+    def test_json_wrapped_github_secret_verifies_bare_signature(self, mock_aws):
+        app, _, mock_secrets = mock_aws
+        app._secret_cache.clear()
+        mock_secrets.get_secret_value.side_effect = None
+        mock_secrets.get_secret_value.return_value = {"SecretString": json.dumps({"gh-webhook-secret": GITHUB_SECRET})}
+        event = _make_event("/webhook/github", GITHUB_BODY, {"x-hub-signature-256": _github_sig(GITHUB_BODY)})
+        assert app.handler(event, None)["statusCode"] == 202
+
+    def test_plain_secret_still_works(self, mock_aws):
+        app, _, _ = mock_aws
+        event = _make_event("/webhook/datadog", DATADOG_BODY, {"x-webhook-secret": DATADOG_SECRET})
+        assert app.handler(event, None)["statusCode"] == 202
+
+    def test_multi_key_json_is_not_unwrapped(self, mock_aws):
+        app, _, _ = mock_aws
+        assert app._secret_value('{"a": "1", "b": "2"}') == '{"a": "1", "b": "2"}'
+
+    def test_malformed_json_is_used_verbatim(self, mock_aws):
+        app, _, _ = mock_aws
+        assert app._secret_value("{not json") == "{not json"

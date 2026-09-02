@@ -107,8 +107,28 @@ def _verify_datadog_header(header_value: str, secret: str) -> bool:
 def _get_secret(arn: str) -> str:
     if arn not in _secret_cache:
         response = _secrets_client.get_secret_value(SecretId=arn)
-        _secret_cache[arn] = response["SecretString"]
+        _secret_cache[arn] = _secret_value(response["SecretString"])
     return _secret_cache[arn]
+
+
+def _secret_value(secret_string: str) -> str:
+    """The shared secret itself, whichever way Secrets Manager holds it.
+
+    Both webhook secrets were created as key/value pairs, so the stored string
+    is '{"gh-webhook-secret": "<hex>"}', while GitHub signs with, and Datadog
+    sends, the bare <hex>. Comparing against the JSON text rejected every
+    real webhook with a 401 (RC1-370). A one-key JSON object yields its value;
+    anything else is used as-is.
+    """
+    stripped = secret_string.strip()
+    if stripped.startswith("{"):
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            return stripped
+        if isinstance(parsed, dict) and len(parsed) == 1:
+            return str(next(iter(parsed.values())))
+    return stripped
 
 
 def _response(status_code: int, body: dict) -> dict:
