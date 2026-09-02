@@ -68,6 +68,10 @@ def handler(event: dict, context) -> dict:
         "received_at": datetime.now(timezone.utc).isoformat(),
         "path": path,
     }
+    if source == "github":
+        # GitHub names the event only in this header; the body of a
+        # workflow_job or push event has no workflow_run key to tell them apart.
+        envelope["github_event"] = event.get("headers", {}).get("x-github-event")
 
     _lambda_client.invoke(
         FunctionName=os.environ["NORMALIZER_FUNCTION_NAME"],

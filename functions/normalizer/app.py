@@ -22,8 +22,13 @@ _DD_RESOLVED_TRANSITIONS = {"Recovered"}
 # ("[Triggered on {service:x}] Error rate"); the fingerprint must not.
 _DD_TITLE_PREFIX = re.compile(r"^(\[[^\]]*\]\s*)+")
 
-_GH_OPEN_CONCLUSIONS = {"failure", "cancelled", "timed_out", "startup_failure"}
-_GH_SEVERITY_MAP = {"failure": "high", "timed_out": "high", "cancelled": "medium"}
+# A run is an alert only once it has completed and not succeeded. Anything
+# else — in_progress / requested runs (no conclusion yet), workflow_job and
+# push events, successful runs — is not an incident (RC1-373: every deploy
+# start used to open a HIGH incident because a missing conclusion defaulted
+# to "failure", and the success 55 s later was deduped away).
+_GH_SUCCESS_CONCLUSIONS = {"success", "skipped", "neutral"}
+_GH_SEVERITY_MAP = {"failure": "high", "timed_out": "high", "startup_failure": "high", "cancelled": "medium"}
 
 
 def handler(event: dict, context) -> dict | None:
@@ -41,6 +46,9 @@ def handler(event: dict, context) -> dict | None:
             alert = _normalize_github(event)
     except Exception:
         logger.exception("Failed to normalize %s event, discarding", source)
+        return None
+
+    if alert is None:
         return None
 
     logger.info("Normalized alert: %s", json.dumps(alert.to_dict()))
@@ -149,13 +157,27 @@ def _normalize_datadog(envelope: dict) -> NormalizedAlert:
     )
 
 
-def _normalize_github(envelope: dict) -> NormalizedAlert:
+def _normalize_github(envelope: dict) -> NormalizedAlert | None:
     payload = envelope["raw_payload"]
-    run = payload["workflow_run"]
-    conclusion = run.get("conclusion") or "failure"
+    event_name = envelope.get("github_event") or ("workflow_run" if "workflow_run" in payload else "unknown")
+    action = payload.get("action")
+    if event_name != "workflow_run" or action != "completed":
+        logger.info("Ignoring github %s.%s event: only completed workflow runs are alerts", event_name, action)
+        return None
 
-    severity = _GH_SEVERITY_MAP.get(conclusion, "low")
-    status = "open" if conclusion in _GH_OPEN_CONCLUSIONS else "resolved"
+    run = payload["workflow_run"]
+    conclusion = run.get("conclusion")
+    if conclusion in _GH_SUCCESS_CONCLUSIONS:
+        logger.info("Ignoring successful github workflow run %r (%s)", run.get("name"), conclusion)
+        return None
+    if not conclusion:
+        logger.warning("Ignoring completed github workflow run %r with no conclusion", run.get("name"))
+        return None
+
+    # Any other conclusion (failure, timed_out, cancelled, startup_failure,
+    # action_required, stale, …) is a run that did not succeed.
+    severity = _GH_SEVERITY_MAP.get(conclusion, "medium")
+    status = "open"
 
     return NormalizedAlert(
         alert_id=str(run["id"]),

@@ -14,7 +14,7 @@ Built with AWS Lambda (Python), SAM, DynamoDB, Claude, Next.js, and Vercel.
 |---|---|---|
 | **CloudWatch** | AWS infrastructure alarms (Lambda errors, timeouts, throttles) | Native EventBridge |
 | **Datadog** | APM and application-level alerts (error rates, latency, service health) | Webhook via API Gateway |
-| **GitHub Actions** | CI/CD pipeline failures | Webhook via API Gateway |
+| **GitHub Actions** | CI/CD pipeline failures — only `workflow_run.completed` events whose conclusion is not success; in-progress runs, successes, `workflow_job` and `push` deliveries are ignored | Webhook via API Gateway |
 
 ---
 
@@ -224,6 +224,10 @@ To notify the pipeline, add `@webhook-incident-summarizer` to a monitor's messag
 ---
 
 ## Known limitations
+
+**Recoveries do not close incidents**
+Every alert the normalizer emits opens or extends an incident, including ones that mean "it recovered": a CloudWatch alarm returning to OK, a Datadog monitor's Recovered transition. The GitHub path drops successful runs outright (RC1-373); the other two still open a low-severity incident on recovery. Closing the matching open incident instead is a follow-up.
+
 
 **Datadog webhook signature verification**
 Datadog's webhook integration does not support HMAC payload signing natively, unlike GitHub Actions which uses `X-Hub-Signature-256`. Instead, a shared secret is passed via a custom `X-Webhook-Secret` header configured in the Datadog webhook settings and stored in AWS Secrets Manager. The receiver validates the header value using a timing-safe comparison. This is Datadog's recommended approach for webhook authentication.
