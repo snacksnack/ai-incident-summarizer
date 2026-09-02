@@ -88,13 +88,14 @@ def _dd_envelope(priority="P1", transition="Triggered", tags=None, alert_type="e
     }
 
 
-def _gh_envelope(conclusion="failure", workflow_name="CI", repo="org/repo"):
+def _gh_envelope(conclusion="failure", workflow_name="CI", repo="org/repo", action="completed", event="workflow_run"):
     return {
         "source": "github",
         "received_at": "2024-01-15T10:30:00+00:00",
         "path": "/webhook/github",
+        "github_event": event,
         "raw_payload": {
-            "action": "completed",
+            "action": action,
             "workflow_run": {
                 "id": 1234567890,
                 "name": workflow_name,
@@ -273,9 +274,78 @@ class TestGitHub:
         assert result["status"] == "open"
         assert result["severity"] == "medium"
 
-    def test_success_returns_resolved(self, normalizer):
-        result = normalizer.handler(_gh_envelope(conclusion="success"), None)
-        assert result["status"] == "resolved"
+    def test_startup_failure_returns_open_high(self, normalizer):
+        result = normalizer.handler(_gh_envelope(conclusion="startup_failure"), None)
+        assert result["status"] == "open"
+        assert result["severity"] == "high"
+
+    def test_unknown_non_success_conclusion_returns_open_medium(self, normalizer):
+        result = normalizer.handler(_gh_envelope(conclusion="action_required"), None)
+        assert result["status"] == "open"
+        assert result["severity"] == "medium"
+
+    # RC1-373: only completed, non-successful workflow runs are alerts.
+    def test_success_is_ignored(self, normalizer, mock_lambda):
+        assert normalizer.handler(_gh_envelope(conclusion="success"), None) is None
+        mock_lambda.invoke.assert_not_called()
+
+    def test_skipped_and_neutral_are_ignored(self, normalizer):
+        assert normalizer.handler(_gh_envelope(conclusion="skipped"), None) is None
+        assert normalizer.handler(_gh_envelope(conclusion="neutral"), None) is None
+
+    def test_in_progress_run_is_ignored_without_error(self, normalizer, mock_lambda, caplog):
+        env = _gh_envelope(action="in_progress")
+        env["raw_payload"]["workflow_run"]["conclusion"] = None
+        env["raw_payload"]["workflow_run"]["status"] = "in_progress"
+        with caplog.at_level("INFO"):
+            assert normalizer.handler(env, None) is None
+        mock_lambda.invoke.assert_not_called()
+        assert "ERROR" not in caplog.text
+        assert "Ignoring github workflow_run.in_progress" in caplog.text
+
+    def test_requested_run_is_ignored(self, normalizer):
+        assert normalizer.handler(_gh_envelope(action="requested"), None) is None
+
+    def test_workflow_job_event_is_ignored_without_error(self, normalizer, mock_lambda, caplog):
+        env = {
+            "source": "github",
+            "received_at": "2024-01-15T10:30:00+00:00",
+            "path": "/webhook/github",
+            "github_event": "workflow_job",
+            "raw_payload": {"action": "completed", "workflow_job": {"id": 1, "conclusion": "success"},
+                            "repository": {"full_name": "org/repo"}},
+        }
+        with caplog.at_level("INFO"):
+            assert normalizer.handler(env, None) is None
+        mock_lambda.invoke.assert_not_called()
+        assert "ERROR" not in caplog.text
+
+    def test_push_event_is_ignored(self, normalizer, mock_lambda):
+        env = {
+            "source": "github",
+            "received_at": "2024-01-15T10:30:00+00:00",
+            "path": "/webhook/github",
+            "github_event": "push",
+            "raw_payload": {"ref": "refs/heads/main", "commits": [], "repository": {"full_name": "org/repo"}},
+        }
+        assert normalizer.handler(env, None) is None
+        mock_lambda.invoke.assert_not_called()
+
+    def test_completed_run_without_conclusion_is_ignored(self, normalizer, mock_lambda):
+        env = _gh_envelope()
+        env["raw_payload"]["workflow_run"]["conclusion"] = None
+        assert normalizer.handler(env, None) is None
+        mock_lambda.invoke.assert_not_called()
+
+    def test_missing_event_header_falls_back_to_payload_shape(self, normalizer):
+        env = _gh_envelope(conclusion="failure")
+        del env["github_event"]
+        assert normalizer.handler(env, None)["status"] == "open"
+
+    def test_missing_event_header_and_no_workflow_run_is_ignored(self, normalizer):
+        env = {"source": "github", "received_at": "2024-01-15T10:30:00+00:00", "path": "/webhook/github",
+               "raw_payload": {"action": "completed", "workflow_job": {}}}
+        assert normalizer.handler(env, None) is None
 
     def test_affected_service_is_repo_full_name(self, normalizer):
         result = normalizer.handler(_gh_envelope(repo="acme/payments-api"), None)

@@ -155,6 +155,23 @@ class TestDatadogWebhook:
         assert payload["source"] == "datadog"
 
 
+class TestGitHubEventHeader:
+    def test_github_event_name_is_forwarded(self, mock_aws):
+        app, mock_lambda, _ = mock_aws
+        sig = _github_sig(GITHUB_BODY)
+        event = _make_event("/webhook/github", GITHUB_BODY, {"x-hub-signature-256": sig, "x-github-event": "workflow_job"})
+        app.handler(event, None)
+        payload = json.loads(mock_lambda.invoke.call_args[1]["Payload"])
+        assert payload["github_event"] == "workflow_job"
+
+    def test_datadog_envelope_has_no_github_event(self, mock_aws):
+        app, mock_lambda, _ = mock_aws
+        event = _make_event("/webhook/datadog", DATADOG_BODY, {"x-webhook-secret": DATADOG_SECRET})
+        app.handler(event, None)
+        payload = json.loads(mock_lambda.invoke.call_args[1]["Payload"])
+        assert "github_event" not in payload
+
+
 class TestUnknownPath:
     def test_unknown_path_returns_404(self, mock_aws):
         app, _, _ = mock_aws
