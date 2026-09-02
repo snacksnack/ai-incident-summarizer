@@ -81,7 +81,7 @@ def _register_service(affected_service: str, now_iso: str) -> None:
 
 
 def _alert_summary(event: dict) -> dict:
-    return {
+    summary = {
         "alert_id": event["alert_id"],
         "source": event["source"],
         "alert_name": event["alert_name"],
@@ -89,6 +89,9 @@ def _alert_summary(event: dict) -> dict:
         "status": event["status"],
         "received_at": event["received_at"],
     }
+    if event.get("monitor_id"):
+        summary["monitor_id"] = event["monitor_id"]
+    return summary
 
 
 def _group_into_window(event: dict, window_seconds: int) -> dict:

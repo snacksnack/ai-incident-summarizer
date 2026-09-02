@@ -203,6 +203,56 @@ class TestDatadog:
         result = normalizer.handler(_dd_envelope(), None)
         assert result["alert_id"] == "dd-alert-abc123"
 
+    # RC1-370: the real webhook template renders $TAGS as one string, carries
+    # the monitor id as alert_id, and prefixes titles with the transition.
+    def test_tags_as_comma_separated_string(self, normalizer):
+        result = normalizer.handler(_dd_envelope(tags="env:prod, service:checkout-service,team:x"), None)
+        assert result["affected_service"] == "checkout-service"
+
+    def test_empty_tags_string_returns_unknown(self, normalizer):
+        env = _dd_envelope()
+        env["raw_payload"]["tags"] = ""  # a monitor with no tags renders $TAGS as ""
+        result = normalizer.handler(env, None)
+        assert result["affected_service"] == "unknown"
+
+    def test_monitor_id_from_alert_id(self, normalizer):
+        env = _dd_envelope()
+        env["raw_payload"]["alert_id"] = "99999"
+        result = normalizer.handler(env, None)
+        assert result["monitor_id"] == "99999"
+
+    def test_monitor_id_absent_when_payload_lacks_it(self, normalizer):
+        result = normalizer.handler(_dd_envelope(), None)
+        assert result["monitor_id"] is None
+
+    def test_monitor_id_absent_when_rendered_empty(self, normalizer):
+        env = _dd_envelope()
+        env["raw_payload"]["alert_id"] = ""
+        result = normalizer.handler(env, None)
+        assert result["monitor_id"] is None
+
+    def test_transition_prefix_stripped_from_alert_name(self, normalizer):
+        env = _dd_envelope()
+        env["raw_payload"]["title"] = "[Triggered on {service:payments-service}] Error rate above threshold"
+        result = normalizer.handler(env, None)
+        assert result["alert_name"] == "Error rate above threshold"
+
+    def test_recovered_and_triggered_share_alert_name(self, normalizer):
+        a = _dd_envelope(transition="Triggered"); a["raw_payload"]["title"] = "[Triggered] Latency"
+        b = _dd_envelope(transition="Recovered"); b["raw_payload"]["title"] = "[Recovered] Latency"
+        assert normalizer.handler(a, None)["alert_name"] == normalizer.handler(b, None)["alert_name"] == "Latency"
+
+    def test_warn_returns_open(self, normalizer):
+        assert normalizer.handler(_dd_envelope(transition="Warn"), None)["status"] == "open"
+
+    def test_no_data_returns_open(self, normalizer):
+        assert normalizer.handler(_dd_envelope(transition="No Data"), None)["status"] == "open"
+
+    def test_unknown_or_missing_transition_stays_open(self, normalizer):
+        env = _dd_envelope()
+        del env["raw_payload"]["alert_transition"]
+        assert normalizer.handler(env, None)["status"] == "open"
+
 
 # ── GitHub Actions tests ──────────────────────────────────────────────────────
 

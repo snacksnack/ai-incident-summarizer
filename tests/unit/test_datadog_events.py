@@ -23,7 +23,7 @@ INCIDENT = {
     "jira_ticket_id": "INC-42",
     "source_alerts": [
         {"alert_id": "a1", "alert_name": "high-error-rate", "source": "cloudwatch"},
-        {"alert_id": "7788990011", "alert_name": "latency-spike", "source": "datadog"},
+        {"alert_id": "7788990011", "alert_name": "latency-spike", "source": "datadog", "monitor_id": "99999"},
     ],
     "llm_summary": json.dumps({
         "summary": "Payments service is down.",
@@ -239,6 +239,20 @@ class TestPayload:
         tags = _posted_event(app)["tags"]
         assert "alert_id:7788990011" in tags
         assert "alert_id:a1" not in tags
+
+    def test_tags_carry_monitor_id_for_datadog_alerts(self, dd):
+        app, _, _ = dd
+        tags = _posted_event(app)["tags"]
+        assert "monitor_id:99999" in tags
+        assert sum(t.startswith("monitor_id:") for t in tags) == 1
+
+    def test_no_monitor_id_tag_when_alert_lacks_one(self, dd):
+        app, _, _ = dd
+        incident = {**INCIDENT, "source_alerts": [
+            {"alert_id": "7788990011", "alert_name": "latency-spike", "source": "datadog"},
+        ]}
+        tags = _posted_event(app, incident)["tags"]
+        assert not any(t.startswith("monitor_id:") for t in tags)
 
     def test_no_jira_tag_before_the_ticket_exists(self, dd):
         app, _, _ = dd

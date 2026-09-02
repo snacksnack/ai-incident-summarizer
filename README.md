@@ -57,7 +57,7 @@ EventBridge        API Gateway (HMAC validation)
 | Field | Description |
 |---|---|
 | `incident_id` (PK) | Unique incident identifier |
-| `source_alerts[]` | Raw alert payloads |
+| `source_alerts[]` | Per-alert summaries (id, source, name, severity, status, received_at; `monitor_id` for Datadog alerts) |
 | `affected_service` | Service name |
 | `severity` | critical / high / medium / low |
 | `status` | open / acknowledged / resolved |
@@ -197,6 +197,14 @@ aws cloudformation describe-stacks --stack-name ai-incident-summarizer \
 | GitHub Actions | `POST <WebhookApiUrl>/webhook/github` |
 | Datadog | `POST <WebhookApiUrl>/webhook/datadog` |
 
+**Datadog payload template.** The webhook definition lives in Datadog, so `scripts/configure_datadog_webhook.py` is the source of truth for what it sends: the monitor id (`$ALERT_ID`), tags as one comma-separated string, `$ALERT_PRIORITY`, `$ALERT_TYPE`, `$ALERT_TRANSITION` and the event link, on top of Datadog's default fields. Datadog's default template carries none of those, and the normalizer needs them for service, severity, status and the `monitor_id:` tag on the written-back event (RC1-370). Re-run the script if the webhook is recreated:
+
+```bash
+DD_API_KEY=… DD_APP_KEY=… python scripts/configure_datadog_webhook.py
+```
+
+To notify the pipeline, add `@webhook-incident-summarizer` to a monitor's message. Monitor **318762066** ("incident-summarizer webhook test signal") exists for exactly that: push `incident_summarizer.test_signal` = 1 to trigger it, 0 to recover.
+
 ---
 
 ## Key design decisions
@@ -217,9 +225,6 @@ aws cloudformation describe-stacks --stack-name ai-incident-summarizer \
 
 **Datadog webhook signature verification**
 Datadog's webhook integration does not support HMAC payload signing natively, unlike GitHub Actions which uses `X-Hub-Signature-256`. Instead, a shared secret is passed via a custom `X-Webhook-Secret` header configured in the Datadog webhook settings and stored in AWS Secrets Manager. The receiver validates the header value using a timing-safe comparison. This is Datadog's recommended approach for webhook authentication.
-
-**Monitor correlation on the written-back event**
-The Datadog webhook is configured with Datadog's default payload template (`$ID`, `$EVENT_TITLE`, `$EVENT_MSG`, `$DATE`, org), which carries no `$ALERT_ID` (the monitor id), no `$TAGS`, and no `$PRIORITY`. The write-back event therefore correlates to the originating monitor by the `service:` tag it shares with the monitor's own events plus an `alert_id:` tag per Datadog-sourced alert (the id of the monitor event that opened the incident), not by a `monitor_id:` tag. Adding `$ALERT_ID`, `$TAGS`, `$PRIORITY`, `$ALERT_TYPE`, `$ALERT_TRANSITION` and `$LINK` to the webhook payload template would let the normalizer set service and severity from the monitor and let the event carry the monitor id — a webhook-config change, tracked separately.
 
 ---
 

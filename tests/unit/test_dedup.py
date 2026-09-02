@@ -263,6 +263,19 @@ class TestWindowGrouping:
             app.handler(ALERT, None)
 
 
+class TestAlertSummary:
+    def test_monitor_id_kept_when_present(self, dedup):
+        app, *_ = dedup
+        summary = app._alert_summary({**ALERT, "monitor_id": "99999"})
+        assert summary["monitor_id"] == "99999"
+        assert "raw_payload" not in summary
+
+    def test_monitor_id_omitted_when_absent(self, dedup):
+        app, *_ = dedup
+        assert "monitor_id" not in app._alert_summary({**ALERT, "monitor_id": None})
+        assert "monitor_id" not in app._alert_summary(ALERT)
+
+
 # ── Incident persistence tests ────────────────────────────────────────────────
 
 class TestIncidentPersistence:

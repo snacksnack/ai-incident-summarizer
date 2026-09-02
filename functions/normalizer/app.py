@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 
 import boto3
 
@@ -15,7 +16,11 @@ _SEVERITY_KEYWORDS = ["critical", "high", "medium", "low"]
 
 _DD_PRIORITY_MAP = {"P1": "critical", "P2": "high", "P3": "medium", "P4": "low"}
 _DD_ALERT_TYPE_MAP = {"error": "high", "warning": "medium", "info": "low"}
-_DD_OPEN_TRANSITIONS = {"Triggered", "Re-Triggered"}
+# Only a recovery closes; anything we cannot classify stays open so it is seen.
+_DD_RESOLVED_TRANSITIONS = {"Recovered"}
+# $ALERT_TITLE / $EVENT_TITLE carry the transition as a bracketed prefix
+# ("[Triggered on {service:x}] Error rate"); the fingerprint must not.
+_DD_TITLE_PREFIX = re.compile(r"^(\[[^\]]*\]\s*)+")
 
 _GH_OPEN_CONCLUSIONS = {"failure", "cancelled", "timed_out", "startup_failure"}
 _GH_SEVERITY_MAP = {"failure": "high", "timed_out": "high", "cancelled": "medium"}
@@ -98,11 +103,25 @@ def _cloudwatch_severity(alarm_name: str, state_value: str) -> str:
     return "high" if state_value == "ALARM" else "low"
 
 
+def _dd_tags(payload: dict) -> list[str]:
+    # The webhook's $TAGS variable renders as one comma-separated string; the
+    # sample payloads and older tests carry a list. Accept both.
+    tags = payload.get("tags") or []
+    if isinstance(tags, str):
+        tags = tags.split(",")
+    return [t.strip() for t in tags if t and t.strip()]
+
+
+def _dd_alert_name(title: str) -> str:
+    stripped = _DD_TITLE_PREFIX.sub("", title).strip()
+    return stripped or title
+
+
 def _normalize_datadog(envelope: dict) -> NormalizedAlert:
     payload = envelope["raw_payload"]
 
     affected_service = "unknown"
-    for tag in payload.get("tags", []):
+    for tag in _dd_tags(payload):
         if tag.startswith("service:"):
             affected_service = tag.split(":", 1)[1]
             break
@@ -113,17 +132,20 @@ def _normalize_datadog(envelope: dict) -> NormalizedAlert:
     )
 
     transition = payload.get("alert_transition", "")
-    status = "open" if transition in _DD_OPEN_TRANSITIONS else "resolved"
+    status = "resolved" if transition in _DD_RESOLVED_TRANSITIONS else "open"
+
+    monitor_id = payload.get("alert_id")
 
     return NormalizedAlert(
         alert_id=str(payload["id"]),
         source="datadog",
-        alert_name=payload["title"],
+        alert_name=_dd_alert_name(payload["title"]),
         affected_service=affected_service,
         severity=severity,
         status=status,
         raw_payload=payload,
         received_at=envelope["received_at"],
+        monitor_id=str(monitor_id) if monitor_id not in (None, "") else None,
     )
 
 
