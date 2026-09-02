@@ -197,6 +197,8 @@ aws cloudformation describe-stacks --stack-name ai-incident-summarizer \
 | GitHub Actions | `POST <WebhookApiUrl>/webhook/github` |
 | Datadog | `POST <WebhookApiUrl>/webhook/datadog` |
 
+`WebhookApiUrl` ends in the API stage (`/prod`). A URL without it returns `404 {"message":"Not Found"}` from API Gateway itself, with nothing in the receiver's logs — the symptom to look for when a webhook "sends but nothing arrives".
+
 **Datadog payload template.** The webhook definition lives in Datadog, so `scripts/configure_datadog_webhook.py` is the source of truth for what it sends: the monitor id (`$ALERT_ID`), tags as one comma-separated string, `$ALERT_PRIORITY`, `$ALERT_TYPE`, `$ALERT_TRANSITION` and the event link, on top of Datadog's default fields. Datadog's default template carries none of those, and the normalizer needs them for service, severity, status and the `monitor_id:` tag on the written-back event (RC1-370). Re-run the script if the webhook is recreated:
 
 ```bash

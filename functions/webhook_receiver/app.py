@@ -19,8 +19,27 @@ GITHUB_PATH = "/webhook/github"
 DATADOG_PATH = "/webhook/datadog"
 
 
-def handler(event: dict, context) -> dict:
+def _route_path(event: dict) -> str:
+    """The path as the routes declare it, independent of the API stage.
+
+    With a named stage (`prod`) API Gateway hands the Lambda
+    `rawPath="/prod/webhook/datadog"`, so matching on rawPath rejected every
+    real request with a silent 404 until RC1-370. `routeKey` ("POST
+    /webhook/datadog") never carries the stage; rawPath minus the stage is the
+    fallback for events that lack it (local invokes, older test fixtures).
+    """
+    route_key = event.get("routeKey") or ""
+    if " " in route_key:
+        return route_key.split(" ", 1)[1]
     path = event.get("rawPath", "")
+    stage = (event.get("requestContext") or {}).get("stage")
+    if stage and stage != "$default" and path.startswith(f"/{stage}/"):
+        return path[len(stage) + 1:]
+    return path
+
+
+def handler(event: dict, context) -> dict:
+    path = _route_path(event)
     body_raw, body_bytes = _extract_body(event)
 
     if path == GITHUB_PATH:
@@ -34,6 +53,7 @@ def handler(event: dict, context) -> dict:
         if not _verify_datadog_header(header_value, secret):
             return _response(401, {"error": "Unauthorized"})
     else:
+        logger.warning("Rejected webhook for unknown path %r (rawPath=%r)", path, event.get("rawPath"))
         return _response(404, {"error": "Not Found"})
 
     try:
