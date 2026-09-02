@@ -283,6 +283,44 @@ class TestDescription:
         assert INCIDENT["slack_thread_id"] in text
 
 
+# ── Secret shape ──────────────────────────────────────────────────────────────
+
+class TestSecretShape:
+    def _password_used(self, app):
+        with patch("requests.post", return_value=_mock_jira_response()) as mock_post:
+            app.handler({"incident_id": "inc-123"}, None)
+        return mock_post.call_args[1]["auth"].password
+
+    def test_bare_token_is_used_as_is(self, jira):
+        app, _, _ = jira
+        assert self._password_used(app) == JIRA_TOKEN
+
+    def test_json_secret_yields_its_api_token(self, jira):
+        app, _, mock_secrets = jira
+        mock_secrets.get_secret_value.return_value = {
+            "SecretString": json.dumps({"email": "someone@example.com", "api_token": "inner-token"})
+        }
+        assert self._password_used(app) == "inner-token"
+
+    def test_surrounding_whitespace_is_stripped(self, jira):
+        app, _, mock_secrets = jira
+        mock_secrets.get_secret_value.return_value = {"SecretString": f"  {JIRA_TOKEN}\n"}
+        assert self._password_used(app) == JIRA_TOKEN
+
+    def test_rejection_body_is_logged_before_raising(self, jira, caplog):
+        app, _, _ = jira
+        mock_response = MagicMock()
+        mock_response.ok = False
+        mock_response.status_code = 400
+        mock_response.text = '{"errors":{"project":"The target project doesn\'t exist"}}'
+        mock_response.raise_for_status.side_effect = requests.HTTPError("400 Client Error")
+        with patch("requests.post", return_value=mock_response), caplog.at_level("ERROR"):
+            with pytest.raises(requests.HTTPError):
+                app.handler({"incident_id": "inc-123"}, None)
+        assert "target project" in caplog.text
+        assert "400" in caplog.text
+
+
 # ── Token caching ─────────────────────────────────────────────────────────────
 
 class TestTokenCaching:

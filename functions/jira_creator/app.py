@@ -33,8 +33,19 @@ def _get_incident_table():
 def _get_api_token() -> str:
     arn = os.environ["JIRA_API_TOKEN_SECRET_ARN"]
     if arn not in _token_cache:
-        _token_cache[arn] = _secrets_client.get_secret_value(SecretId=arn)["SecretString"]
+        _token_cache[arn] = _token_from_secret(_secrets_client.get_secret_value(SecretId=arn)["SecretString"])
     return _token_cache[arn]
+
+
+def _token_from_secret(secret_string: str) -> str:
+    # The secret is shared with the stale-ticket bot, whose contract is
+    # {"email": ..., "api_token": ...}. Sending that JSON as the password made
+    # Jira treat every create as anonymous (400 "project doesn't exist") — RC1-371.
+    # A bare token still works, so a secret of either shape is accepted.
+    stripped = secret_string.strip()
+    if stripped.startswith("{"):
+        return json.loads(stripped)["api_token"]
+    return stripped
 
 
 def _build_description(incident: dict) -> dict:
@@ -108,6 +119,8 @@ def _create_jira_ticket(incident: dict) -> str:
         headers={"Accept": "application/json"},
         timeout=10,
     )
+    if not response.ok:
+        logger.error("Jira rejected issue creation (%s): %s", response.status_code, response.text[:500])
     response.raise_for_status()
     return response.json()["key"]
 
