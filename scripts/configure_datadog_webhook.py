@@ -8,8 +8,10 @@ transition or monitor id, and the normalizer needs all four).
 
     DD_API_KEY=... DD_APP_KEY=... python scripts/configure_datadog_webhook.py [--name incident-summarizer]
 
-Only the payload is replaced; the URL and the X-Webhook-Secret header are
-re-sent exactly as Datadog currently holds them, so no secret is needed here.
+The X-Webhook-Secret header is re-sent exactly as Datadog currently holds it,
+so no secret is needed here. The URL is kept unless --url is given; it must
+include the API stage (see the WebhookApiUrl stack output), or API Gateway
+answers 404 before the receiver ever runs.
 """
 import argparse
 import json
@@ -50,6 +52,7 @@ PAYLOAD_TEMPLATE = {
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--name", default="incident-summarizer")
+    parser.add_argument("--url", help="replace the target URL too (the WebhookApiUrl stack output + /webhook/datadog)")
     parser.add_argument("--dry-run", action="store_true", help="print the template, change nothing")
     args = parser.parse_args()
 
@@ -65,7 +68,7 @@ def main() -> int:
 
     body = {
         "name": args.name,
-        "url": current["url"],
+        "url": args.url or current["url"],
         "custom_headers": current.get("custom_headers"),
         "encode_as": "json",
         "payload": payload,
@@ -74,7 +77,7 @@ def main() -> int:
     if not resp.ok:
         print(f"Datadog rejected the update ({resp.status_code}): {resp.text[:500]}", file=sys.stderr)
         return 1
-    print(f"Updated webhook {args.name!r} -> {current['url']}")
+    print(f"Updated webhook {args.name!r} -> {body['url']}")
     print(resp.json()["payload"])
     return 0
 

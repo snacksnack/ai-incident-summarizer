@@ -466,8 +466,12 @@ Resources:
 
 Outputs:
   WebhookApiUrl:
-    Description: Base URL for the webhook API endpoint
-    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com"
+    # The HTTP API's only stage is `prod`, and a named stage is part of the
+    # invoke URL. Without it every call 404s at API Gateway before the receiver
+    # runs — which is where both the Datadog and GitHub webhooks pointed until
+    # RC1-370.
+    Description: Base URL for the webhook API endpoint (includes the stage)
+    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${WebhookApiprodStage}"
 
   NormalizerDLQUrl:
     Description: SQS DLQ URL for failed EventBridge-to-normalizer deliveries

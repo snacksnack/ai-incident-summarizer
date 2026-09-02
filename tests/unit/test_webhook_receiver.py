@@ -161,3 +161,42 @@ class TestUnknownPath:
         event = _make_event("/webhook/unknown", "{}", {})
         response = app.handler(event, None)
         assert response["statusCode"] == 404
+
+
+class TestStagePrefix:
+    """RC1-370: API Gateway prefixes rawPath with the stage name in production."""
+
+    def test_stage_prefixed_raw_path_is_accepted(self, mock_aws):
+        app, _, _ = mock_aws
+        event = _make_event("/prod/webhook/datadog", DATADOG_BODY, {"x-webhook-secret": DATADOG_SECRET})
+        event["requestContext"] = {"stage": "prod", "http": {"method": "POST", "path": "/prod/webhook/datadog"}}
+        response = app.handler(event, None)
+        assert response["statusCode"] == 202
+
+    def test_route_key_wins_over_raw_path(self, mock_aws):
+        app, _, _ = mock_aws
+        event = _make_event("/prod/webhook/github", DATADOG_BODY, {"x-webhook-secret": DATADOG_SECRET})
+        event["routeKey"] = "POST /webhook/datadog"
+        response = app.handler(event, None)
+        assert response["statusCode"] == 202
+
+    def test_forwarded_envelope_path_has_no_stage(self, mock_aws):
+        app, mock_lambda, _ = mock_aws
+        event = _make_event("/prod/webhook/datadog", DATADOG_BODY, {"x-webhook-secret": DATADOG_SECRET})
+        event["routeKey"] = "POST /webhook/datadog"
+        app.handler(event, None)
+        payload = json.loads(mock_lambda.invoke.call_args[1]["Payload"])
+        assert payload["path"] == "/webhook/datadog"
+        assert payload["source"] == "datadog"
+
+    def test_default_stage_is_not_stripped(self, mock_aws):
+        app, _, _ = mock_aws
+        event = _make_event("/webhook/datadog", DATADOG_BODY, {"x-webhook-secret": DATADOG_SECRET})
+        event["requestContext"] = {"stage": "$default"}
+        assert app.handler(event, None)["statusCode"] == 202
+
+    def test_unknown_path_is_logged(self, mock_aws, caplog):
+        app, _, _ = mock_aws
+        with caplog.at_level("WARNING"):
+            app.handler(_make_event("/prod/webhook/nope", "{}", {}), None)
+        assert "unknown path" in caplog.text
