@@ -64,14 +64,19 @@ Resources:
 
   # ── Shared layer ────────────────────────────────────────────────────────────
 
+  # No BuildMethod on purpose. ContentUri already carries the python/common/
+  # layout Lambda expects; a BuildMethod makes `sam build` copy that tree into
+  # a second python/ directory, and the layer ships as python/python/common —
+  # which is how every normalizer invocation died on `import common` from
+  # layer version 2 (2026-05-18) until RC1-371. Without one, SAM zips the
+  # directory as-is. The layer has no dependencies to install.
+
   CommonLayer:
     Type: AWS::Serverless::LayerVersion
     Properties:
       ContentUri: layers/common/
       CompatibleRuntimes:
         - python3.11
-    Metadata:
-      BuildMethod: python3.11
 
   # ── Webhook path (Datadog + GitHub Actions) ─────────────────────────────────
 
