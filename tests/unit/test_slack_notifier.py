@@ -136,6 +136,44 @@ class TestHandler:
         mock_table.update_item.assert_not_called()
 
 
+# ── Delivery chain ────────────────────────────────────────────────────────────
+
+class TestJiraHandoff:
+    def _invoke_payload(self, app):
+        app._lambda_client.invoke.assert_called_once()
+        kwargs = app._lambda_client.invoke.call_args[1]
+        assert kwargs["FunctionName"] == JIRA_CREATOR_FUNCTION
+        assert kwargs["InvocationType"] == "Event"
+        return json.loads(kwargs["Payload"])
+
+    def test_new_incident_invokes_jira_creator(self, notifier):
+        app, mock_table, _ = notifier
+        mock_table.get_item.return_value = {"Item": INCIDENT}
+        mock_slack = MagicMock()
+        mock_slack.chat_postMessage.return_value = {"ts": "1705312800.000001"}
+        with patch("app.WebClient", return_value=mock_slack):
+            app.handler({"incident_id": "inc-123"}, None)
+        assert self._invoke_payload(app) == {"incident_id": "inc-123"}
+
+    def test_existing_incident_also_invokes_jira_creator(self, notifier):
+        app, mock_table, _ = notifier
+        mock_table.get_item.return_value = {"Item": INCIDENT_WITH_THREAD}
+        mock_slack = MagicMock()
+        mock_slack.chat_postMessage.return_value = {"ts": "1705312900.000001"}
+        with patch("app.WebClient", return_value=mock_slack):
+            app.handler({"incident_id": "inc-123"}, None)
+        assert self._invoke_payload(app) == {"incident_id": "inc-123"}
+
+    def test_no_handoff_when_slack_post_fails(self, notifier):
+        app, _, _ = notifier
+        mock_slack = MagicMock()
+        mock_slack.chat_postMessage.side_effect = _slack_api_error()
+        with patch("app.WebClient", return_value=mock_slack), patch("app.time.sleep"):
+            with pytest.raises(SlackApiError):
+                app.handler({"incident_id": "inc-123"}, None)
+        app._lambda_client.invoke.assert_not_called()
+
+
 # ── Message format ────────────────────────────────────────────────────────────
 
 class TestMessageFormat:

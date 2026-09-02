@@ -88,6 +88,18 @@ def _post_with_retry(client: WebClient, **kwargs) -> dict:
             time.sleep(delay)
 
 
+def _invoke_jira_creator(incident_id: str) -> None:
+    # Next stop in the delivery chain on both paths. The Jira creator is
+    # idempotent about its ticket and hands off to the Datadog events writer,
+    # so a reply in an existing thread still reaches the Datadog timeline.
+    _lambda_client.invoke(
+        FunctionName=os.environ["JIRA_CREATOR_FUNCTION_NAME"],
+        InvocationType="Event",
+        Payload=json.dumps({"incident_id": incident_id}),
+    )
+    logger.info("Jira creator invoked for incident %s", incident_id)
+
+
 def handler(event: dict, context) -> dict | None:
     incident_id = event.get("incident_id")
     if not incident_id:
@@ -109,6 +121,7 @@ def handler(event: dict, context) -> dict | None:
     if slack_thread_id:
         _post_with_retry(client, channel=channel, text=text, thread_ts=slack_thread_id)
         logger.info("Posted reply to thread %s for incident %s", slack_thread_id, incident_id)
+        _invoke_jira_creator(incident_id)
         return {"incident_id": incident_id, "slack_thread_id": slack_thread_id}
 
     result = _post_with_retry(client, channel=channel, text=text)
@@ -120,11 +133,5 @@ def handler(event: dict, context) -> dict | None:
     )
     logger.info("Opened new thread %s for incident %s", thread_ts, incident_id)
 
-    _lambda_client.invoke(
-        FunctionName=os.environ["JIRA_CREATOR_FUNCTION_NAME"],
-        InvocationType="Event",
-        Payload=json.dumps({"incident_id": incident_id}),
-    )
-    logger.info("Jira creator invoked for incident %s", incident_id)
-
+    _invoke_jira_creator(incident_id)
     return {"incident_id": incident_id, "slack_thread_id": thread_ts}
