@@ -148,7 +148,7 @@ class TestDedupHandler:
         assert call_kwargs["Item"]["fingerprint"] == generate_fingerprint(
             ALERT["source"], ALERT["alert_name"], ALERT["affected_service"]
         )
-        assert call_kwargs["ConditionExpression"] == "attribute_not_exists(fingerprint)"
+        assert "ConditionExpression" in call_kwargs  # shape asserted in test_condition_accepts_missing_or_expired_fingerprint
 
     def test_duplicate_returns_none(self, dedup):
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
@@ -171,6 +171,23 @@ class TestDedupHandler:
         mock_dedup_table.put_item.side_effect = _other_dynamo_error()
         with pytest.raises(ClientError):
             app.handler(ALERT, None)
+
+    def test_condition_accepts_missing_or_expired_fingerprint(self, dedup):
+        # RC1-372: DynamoDB's TTL sweep is lazy (up to ~48 h), so the condition
+        # itself must treat an expired row as absent.
+        from boto3.dynamodb.conditions import ConditionExpressionBuilder
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
+        mock_dedup_table.put_item.return_value = {}
+        self._setup_new_incident(mock_window_table, mock_incident_table)
+        with patch("time.time", return_value=1_700_000_000):
+            app.handler(ALERT, None)
+        condition = mock_dedup_table.put_item.call_args[1]["ConditionExpression"]
+        built = ConditionExpressionBuilder().build_expression(condition)
+        names = {v: k for k, v in built.attribute_name_placeholders.items()}
+        values = built.attribute_value_placeholders
+        expr = built.condition_expression
+        assert expr == f"(attribute_not_exists({names['fingerprint']}) OR {names['ttl']} <= :v0)"
+        assert values[":v0"] == 1_700_000_000
 
     def test_ttl_equals_now_plus_window(self, dedup):
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
