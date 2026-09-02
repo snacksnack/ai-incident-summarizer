@@ -202,7 +202,8 @@ def handler(event: dict, context) -> dict | None:
     )
 
     window_seconds = int(os.environ.get("CORRELATION_WINDOW_MINUTES", "5")) * 60
-    ttl = int(time.time()) + window_seconds
+    now = int(time.time())
+    ttl = now + window_seconds
 
     try:
         _get_table().put_item(
@@ -213,7 +214,13 @@ def handler(event: dict, context) -> dict | None:
                 "alert_name": event["alert_name"],
                 "ttl": ttl,
             },
-            ConditionExpression="attribute_not_exists(fingerprint)",
+            # An expired row that DynamoDB's TTL sweep has not yet removed (it
+            # promises deletion within ~48 h, not at expiry) must not count as a
+            # duplicate, or the 5-minute window silently becomes a 2-day one
+            # (RC1-372). Same rule the correlation window already applies.
+            ConditionExpression=(
+                Attr("fingerprint").not_exists() | Attr("ttl").lte(now)
+            ),
         )
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":

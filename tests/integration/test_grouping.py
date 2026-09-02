@@ -95,3 +95,58 @@ class TestWindowExpiry:
 
         assert result3["is_new"] is True
         assert result3["incident_id"] != result1["incident_id"]
+
+
+
+class TestDedupExpiry:
+    """RC1-372: a fingerprint row whose ttl has passed but which DynamoDB's lazy
+    TTL sweep has not yet deleted must not suppress the alert."""
+
+    def _seed_fingerprint(self, dedup_app, dynamodb_tables, alert, ttl):
+        from common.fingerprint import generate_fingerprint
+        dedup_table, _, _ = dynamodb_tables
+        dedup_table.put_item(Item={
+            "fingerprint": generate_fingerprint(
+                source=alert["source"],
+                alert_name=alert["alert_name"],
+                affected_service=alert["affected_service"],
+            ),
+            "first_seen_at": "2024-01-15T10:00:00Z",
+            "source": alert["source"],
+            "alert_name": alert["alert_name"],
+            "ttl": ttl,
+        })
+
+    def test_expired_but_unswept_fingerprint_does_not_suppress(self, dedup_app, dynamodb_tables):
+        alert = _make_alert("payments-service", alert_name="error-rate")
+        self._seed_fingerprint(dedup_app, dynamodb_tables, alert, ttl=int(time.time()) - 3600)
+
+        result = dedup_app.handler(alert, None)
+
+        assert result is not None
+        assert result["is_new"] is True
+        dedup_table, _, _ = dynamodb_tables
+        row = dedup_table.get_item(Key={"fingerprint": dedup_app.generate_fingerprint(
+            source=alert["source"], alert_name=alert["alert_name"], affected_service=alert["affected_service"],
+        )})["Item"]
+        assert int(row["ttl"]) > int(time.time())  # row refreshed, not just tolerated
+
+    def test_live_fingerprint_still_suppresses(self, dedup_app, dynamodb_tables):
+        alert = _make_alert("payments-service", alert_name="error-rate")
+        self._seed_fingerprint(dedup_app, dynamodb_tables, alert, ttl=int(time.time()) + 120)
+
+        assert dedup_app.handler(alert, None) is None
+        dedup_app._lambda_client.invoke.assert_not_called()
+
+    def test_same_alert_again_after_window_is_accepted(self, dedup_app):
+        alert = _make_alert("payments-service", alert_name="error-rate")
+        first = dedup_app.handler(alert, None)
+        assert first["is_new"] is True
+
+        future = int(time.time()) + 5 * 60 + 10
+        with patch("time.time", return_value=future):
+            again = dedup_app.handler(alert, None)
+
+        assert again is not None
+        assert again["is_new"] is True
+        assert again["incident_id"] != first["incident_id"]
