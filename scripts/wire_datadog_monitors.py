@@ -55,6 +55,7 @@ TARGETS = (
     Target(318355170, "Production deploy failed — Fly & Heroku paths", "delivery-pipeline", 2),
     Target(318355169, "CI pipeline failed — delivery repos", "delivery-pipeline", 3),
     Target(318097614, "Fleet LLM spend guardrail — daily", "agent-fleet", 3),
+    Target(318833109, "Fleet LLM cost per call — price signal", "agent-fleet", 3),
 )
 
 
