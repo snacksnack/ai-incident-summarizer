@@ -18,10 +18,14 @@ import importlib.util
 import inspect
 import os
 import re
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_PATH = REPO_ROOT / "functions" / "summarizer" / "app.py"
+# The Lambda imports `common` from the shared layer (RC1-374); in production the
+# layer is on sys.path, here it has to be put there before the module body runs.
+LAYER_PATH = REPO_ROOT / "layers" / "common" / "python"
 TEMPLATE_PATH = REPO_ROOT / "template.yaml"
 
 #: Mirrors the shipped `_call_llm` call, which hardcodes 1024. The eval must
@@ -35,6 +39,8 @@ def app():
     global _app
     if _app is None:
         os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+        if str(LAYER_PATH) not in sys.path:
+            sys.path.insert(0, str(LAYER_PATH))
         spec = importlib.util.spec_from_file_location("incident_summarizer_app", APP_PATH)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
