@@ -44,7 +44,28 @@ Parameters:
 
 Globals:
   Function:
-    Runtime: python3.11
+    # python3.14 on Amazon Linux 2023 (RC1-221). AL2 reached end of life on
+    # 2026-06-30 and python3.11 rode it; 3.14 deprecates 2029-06-30, the
+    # furthest-out date available (3.13 shares it; 3.15 is public preview and
+    # not for production). Local .venv, both CI workflows and this runtime are
+    # deliberately the same interpreter — they disagreed before, so tests ran
+    # on one Python and production on another.
+    #
+    # The Datadog layer version below is pinned and must move with this line:
+    # the Python version is baked into the *layer name*, and the handler is
+    # Datadog's wrapper, so a mismatch fails at import on the first invocation
+    # of every function behind a green CloudFormation deploy.
+    #
+    # Finding the latest layer version is not obvious: Datadog's resource
+    # policy grants GetLayerVersion but not ListLayerVersions, so `aws lambda
+    # list-layer-versions` returns AccessDenied and an unpublished version is
+    # indistinguishable from one you cannot read. Probe upward instead:
+    #   aws lambda get-layer-version --region us-east-1 \
+    #     --layer-name arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Python314 \
+    #     --version-number N
+    # Datadog-Python314:127 and Datadog-Extension:99 were the latest published
+    # on 2026-09-04.
+    Runtime: python3.14
     Timeout: 29
     MemorySize: 128
     Handler: datadog_lambda.handler.handler
@@ -76,7 +97,7 @@ Resources:
     Properties:
       ContentUri: layers/common/
       CompatibleRuntimes:
-        - python3.11
+        - python3.14
 
   # ── Webhook path (Datadog + GitHub Actions) ─────────────────────────────────
 
@@ -92,8 +113,8 @@ Resources:
       CodeUri: functions/webhook_receiver/
       Description: Validates HMAC signatures and forwards payloads to the normalizer
       Layers:
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           GITHUB_WEBHOOK_SECRET_ARN: !Ref GithubWebhookSecretArn
@@ -134,8 +155,8 @@ Resources:
       Description: Normalises raw alert payloads to the shared incident schema
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           DEDUP_FUNCTION_NAME: !Ref DedupFunction
@@ -186,8 +207,8 @@ Resources:
       Description: Suppresses duplicate alerts and groups related alerts into incidents
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           DEDUP_TABLE_NAME: !Ref DeduplicationTable
@@ -282,8 +303,8 @@ Resources:
       Description: Summarizes grouped incidents using Claude via the Anthropic API
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
@@ -313,8 +334,8 @@ Resources:
       Description: Posts incident summaries to Slack and maintains thread continuity
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
@@ -344,8 +365,8 @@ Resources:
       Description: Creates Jira tickets for new incidents and writes the ticket ID back to DynamoDB
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
@@ -381,8 +402,8 @@ Resources:
       Description: Posts incident summaries to the Datadog Events API and writes the event ID back to DynamoDB
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
