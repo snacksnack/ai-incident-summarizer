@@ -125,7 +125,7 @@ ai-incident-summarizer/
 
 - [AWS CLI](https://aws.amazon.com/cli/) configured (`aws configure`)
 - [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
-- Python 3.11+
+- Python 3.14+
 - A Datadog account with API key stored in AWS Secrets Manager
 - A Slack app with `chat:write` and `chat:write.public` scopes
 - A Jira API token
@@ -223,7 +223,7 @@ DD_API_KEY=… DD_APP_KEY=… python scripts/wire_datadog_monitors.py --dry-run 
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Runtime | Lambda (Python 3.11) | Stateless, zero cost at idle, easy to deploy |
+| Runtime | Lambda (Python 3.14, Amazon Linux 2023) | Stateless, zero cost at idle, easy to deploy |
 | State management | DynamoDB TTL | Lambda is stateless; window state lives in DynamoDB |
 | Secret management | AWS Secrets Manager | API keys never stored in plain text or env vars |
 | Deployment | AWS SAM | Native AWS tooling, infrastructure-as-code |
