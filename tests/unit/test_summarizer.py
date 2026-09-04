@@ -209,7 +209,11 @@ class TestRecovery:
         app, mock_table, *_ = summarizer
         self._run(app, mock_table)
         kwargs = mock_table.update_item.call_args[1]
-        assert kwargs["UpdateExpression"] == "SET recovery_summary = :s"
+        # The claim marker rides along in the same update (RC1-384); what this
+        # test guards is that the *summary* lands in recovery_summary and
+        # leaves llm_summary alone.
+        assert "SET recovery_summary = :s" in kwargs["UpdateExpression"]
+        assert "llm_summary" not in kwargs["UpdateExpression"]
         assert json.loads(kwargs["ExpressionAttributeValues"][":s"]) == RECOVERY_RESPONSE
 
     def test_recovery_prompt_describes_the_recovery(self, summarizer):
@@ -243,3 +247,77 @@ class TestRecovery:
         with patch("anthropic.Anthropic", _mock_anthropic()):
             app.handler({"incident_id": "inc-123"}, None)
         assert json.loads(app._lambda_client.invoke.call_args[1]["Payload"]) == {"incident_id": "inc-123"}
+
+
+# ── Delivery is claimed once per generation (RC1-384) ─────────────────────────
+
+class TestDeliveryClaim:
+    """`dedup` invokes this function asynchronously, so Lambda retries a failed
+    invocation twice. The handler used to do its Slack invoke unconditionally,
+    which meant a retry of a run that had already delivered posted the same
+    summary into the thread again — and the function was timing out *after*
+    delivering, so every incident was a retry candidate.
+
+    The summary write now carries the generation it summarized and refuses to
+    go backwards. A repeat of the same generation stops before Slack; a real
+    re-summary, with another alert in the window, still gets through.
+    """
+
+    @staticmethod
+    def _conditional_check_failed():
+        from botocore.exceptions import ClientError
+
+        return ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException", "Message": "no"}},
+            "UpdateItem",
+        )
+
+    def test_claims_the_generation_it_summarized(self, summarizer):
+        app, mock_table, _ = summarizer
+        with patch("anthropic.Anthropic", _mock_anthropic()):
+            app.handler({"incident_id": "inc-123"}, None)
+        kwargs = mock_table.update_item.call_args[1]
+        # INCIDENT carries two source_alerts.
+        assert kwargs["ExpressionAttributeValues"][":g"] == 2
+        assert "summarized_alert_count" in kwargs["UpdateExpression"]
+        assert "attribute_not_exists(summarized_alert_count)" in kwargs["ConditionExpression"]
+        assert "summarized_alert_count < :g" in kwargs["ConditionExpression"]
+
+    def test_repeat_of_the_same_generation_does_not_notify(self, summarizer):
+        app, mock_table, _ = summarizer
+        mock_table.update_item.side_effect = self._conditional_check_failed()
+        with patch("anthropic.Anthropic", _mock_anthropic()):
+            result = app.handler({"incident_id": "inc-123"}, None)
+        assert result is None
+        app._lambda_client.invoke.assert_not_called()
+
+    def test_first_delivery_still_notifies(self, summarizer):
+        app, _, _ = summarizer
+        with patch("anthropic.Anthropic", _mock_anthropic()):
+            app.handler({"incident_id": "inc-123"}, None)
+        app._lambda_client.invoke.assert_called_once()
+
+    def test_recovery_claims_a_separate_marker(self, summarizer):
+        """A recovery summary is a different field and must not be blocked by
+        the open-incident claim, or a resolved incident never announces itself."""
+        app, mock_table, _ = summarizer
+        mock_table.get_item.return_value = {"Item": RESOLVED_INCIDENT}
+        with patch("anthropic.Anthropic", _mock_anthropic()):
+            app.handler({"incident_id": "inc-123", "recovered": True}, None)
+        kwargs = mock_table.update_item.call_args[1]
+        assert "recovery_summarized_count" in kwargs["UpdateExpression"]
+        assert "summarized_alert_count" not in kwargs["UpdateExpression"]
+
+    def test_a_real_dynamodb_error_is_not_swallowed(self, summarizer):
+        """Only the conditional check means 'already delivered'. Anything else
+        is a broken table and must page rather than look like a duplicate."""
+        from botocore.exceptions import ClientError
+
+        app, mock_table, _ = summarizer
+        mock_table.update_item.side_effect = ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "slow down"}},
+            "UpdateItem",
+        )
+        with patch("anthropic.Anthropic", _mock_anthropic()):
+            with pytest.raises(ClientError):
+                app.handler({"incident_id": "inc-123"}, None)
