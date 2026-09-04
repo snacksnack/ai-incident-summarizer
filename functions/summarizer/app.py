@@ -4,6 +4,7 @@ import os
 
 import anthropic
 import boto3
+from botocore.exceptions import ClientError
 
 from common.duration import incident_duration
 
@@ -137,11 +138,43 @@ def handler(event: dict, context) -> dict | None:
         logger.exception("LLM summarization failed for incident %s, using fallback", incident_id)
         llm_summary = json.dumps(_fallback_summary(incident, recovered=recovered))
 
-    _get_incident_table().update_item(
-        Key={"incident_id": incident_id},
-        UpdateExpression=f"SET {field} = :s",
-        ExpressionAttributeValues={":s": llm_summary},
-    )
+    # Write the summary and claim delivery in one conditional update (RC1-384).
+    #
+    # `dedup` invokes this function with InvocationType="Event", so a failed
+    # invocation is retried by Lambda twice. The Slack invoke below is the last
+    # thing this handler does, which means a retry of a run that already got
+    # that far posts the same summary into the thread a second time. That is
+    # not hypothetical: the function was timing out *after* delivering, so
+    # every incident was a retry candidate.
+    #
+    # `source_alerts` grows by one per alert joined to the incident, so its
+    # length identifies the generation being summarized. A retry of the same
+    # generation fails the condition and stops before Slack; a genuine
+    # re-summary — a new alert landed in the window — carries a higher count
+    # and proceeds, which is the threaded-reply behavior the chain is built on.
+    #
+    # Deliberately claimed *after* the model call rather than before: claiming
+    # first would make a crash mid-summarize look delivered, and a dropped
+    # incident is worse than a repeated model call on a rare retry.
+    marker = "recovery_summarized_count" if recovered else "summarized_alert_count"
+    generation = len(incident.get("source_alerts") or [])
+    try:
+        _get_incident_table().update_item(
+            Key={"incident_id": incident_id},
+            UpdateExpression=f"SET {field} = :s, {marker} = :g",
+            ConditionExpression=f"attribute_not_exists({marker}) OR {marker} < :g",
+            ExpressionAttributeValues={":s": llm_summary, ":g": generation},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        logger.info(
+            "Incident %s already delivered %s for generation %s, not notifying again",
+            incident_id,
+            field,
+            generation,
+        )
+        return None
     logger.info("%s written to DynamoDB for incident %s", field, incident_id)
 
     _lambda_client.invoke(

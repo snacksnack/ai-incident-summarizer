@@ -301,6 +301,16 @@ Resources:
     Properties:
       CodeUri: functions/summarizer/
       Description: Summarizes grouped incidents using Claude via the Anthropic API
+      # Overrides the 29 s in Globals (RC1-384). That number exists for the
+      # webhook receiver alone — API Gateway caps its integration at 29 s — and
+      # every other function inherited it by accident. This one makes a model
+      # call: it averaged ~23 s through early September and hit the 29 s wall
+      # on 2026-09-03, finishing its work and then being killed, so the chain
+      # completed while CloudWatch logged an error on every incident. It is
+      # invoked asynchronously and sits behind no API Gateway, so the cap never
+      # applied to it. 120 s is headroom for a slow model call, not a target;
+      # if a summary ever legitimately approaches it, the prompt is the problem.
+      Timeout: 120
       Layers:
         - !Ref CommonLayer
         - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
