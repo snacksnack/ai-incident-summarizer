@@ -15,6 +15,7 @@ _secrets_client = boto3.client("secretsmanager")
 _lambda_client = boto3.client("lambda")
 _dynamodb = boto3.resource("dynamodb")
 _incident_table = None
+_anthropic_client = None
 _api_key_cache: dict[str, str] = {}
 
 
@@ -87,8 +88,28 @@ Respond with a JSON object containing exactly these three fields:
 Return only the JSON object. Do not include markdown, code fences, or any other text."""
 
 
+def _get_anthropic_client() -> anthropic.Anthropic:
+    """One client for the life of the execution environment (RC1-385).
+
+    It used to be constructed inside `_call_llm`, so every invocation left
+    another `httpx` connection pool behind. On python3.11 that was waste;
+    on python3.14 it stopped the invocation from ever completing — the
+    handler did all its work in ~16 s and the runtime then sat until the
+    deadline, 105 s later, with `Exiting: timeout` and no error. Nothing in
+    the logs pointed at it, because from the handler's point of view the
+    work had succeeded. The other six functions were unaffected; this is the
+    only one that talks to the Anthropic SDK.
+
+    Reusing the client also skips the TLS handshake on a warm invocation.
+    """
+    global _anthropic_client
+    if _anthropic_client is None:
+        _anthropic_client = anthropic.Anthropic(api_key=_get_api_key())
+    return _anthropic_client
+
+
 def _call_llm(incident: dict, recovered: bool = False) -> dict:
-    client = anthropic.Anthropic(api_key=_get_api_key())
+    client = _get_anthropic_client()
     prompt = _build_recovery_prompt(incident) if recovered else _build_prompt(incident)
     message = client.messages.create(
         model=os.environ["MODEL_ID"],
