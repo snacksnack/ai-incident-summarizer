@@ -13,7 +13,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: "3.11"
 
       # Pinned deliberately. `sam validate --lint` runs cfn-lint bundled inside the
       # SAM CLI, and cfn-lint ships a dataset of Lambda runtime deprecation dates

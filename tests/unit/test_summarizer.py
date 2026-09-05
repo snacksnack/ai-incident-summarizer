@@ -327,11 +327,12 @@ class TestDeliveryClaim:
 
 class TestClientReuse:
     """A client built per invocation leaves an httpx connection pool behind
-    each time. On python3.14 that stopped the invocation from ever completing:
-    the handler finished its work in ~16 s and the runtime then sat until the
-    deadline 105 s later, reporting `Exiting: timeout` with nothing in the log
-    to explain it. The handler had succeeded, so no error surfaced — only the
-    REPORT line showed it.
+    each time and pays for a fresh TLS handshake.
+
+    Written while chasing the python3.14 hang (RC1-385) on the theory that the
+    leak was its cause. It was not — the hang survived this unchanged and the
+    runtime went back to python3.11. These tests stay because the reuse is
+    right on its own terms, not because they guard against that bug.
     """
 
     def test_client_is_built_once_across_invocations(self, summarizer):
