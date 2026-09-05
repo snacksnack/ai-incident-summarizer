@@ -44,12 +44,30 @@ Parameters:
 
 Globals:
   Function:
-    # python3.14 on Amazon Linux 2023 (RC1-221). AL2 reached end of life on
-    # 2026-06-30 and python3.11 rode it; 3.14 deprecates 2029-06-30, the
-    # furthest-out date available (3.13 shares it; 3.15 is public preview and
-    # not for production). Local .venv, both CI workflows and this runtime are
-    # deliberately the same interpreter — they disagreed before, so tests ran
-    # on one Python and production on another.
+    # python3.11 — reverted from python3.14 on 2026-09-05 (RC1-385).
+    #
+    # RC1-221 moved all seven functions to 3.14 and the chain passed, but
+    # SummarizerFunction stopped completing: it did its work in ~16 s and then
+    # sat until whatever deadline it was given (29 s, then 120 s, then 60 s),
+    # ending in `Exiting: timeout` with no exception and nothing in the log to
+    # explain it. Every incident logged a Lambda error while appearing to
+    # succeed. Two fixes were tried and neither touched it — the timeout was
+    # never the constraint, and reusing the Anthropic client across
+    # invocations changed nothing. Rather than keep guessing on production,
+    # this is back on the runtime that ran clean for six consecutive
+    # invocations. RC1-385 holds the open investigation.
+    #
+    # Do not re-attempt the upgrade without first answering "extension or
+    # SDK": deploy the summarizer alone with DD_TRACE_ENABLED=false on 3.14
+    # and see whether the hang survives. python3.12 (AL2023, deprecates
+    # 2028-10-31) is the smaller next step if it turns out to be specific to
+    # 3.14 rather than to AL2023.
+    #
+    # The clock this is running against: python3.11 sits on Amazon Linux 2,
+    # which reached end of life 2026-06-30. AWS patches it for critical AL2
+    # issues until deprecation on 2027-06-30; creates block 2027-07-31 and
+    # updates 2027-08-31. Roughly 22 months of runway — comfortable, not
+    # indefinite.
     #
     # The Datadog layer version below is pinned and must move with this line:
     # the Python version is baked into the *layer name*, and the handler is
@@ -61,11 +79,12 @@ Globals:
     # list-layer-versions` returns AccessDenied and an unpublished version is
     # indistinguishable from one you cannot read. Probe upward instead:
     #   aws lambda get-layer-version --region us-east-1 \
-    #     --layer-name arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Python314 \
+    #     --layer-name arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Python311 \
     #     --version-number N
-    # Datadog-Python314:127 and Datadog-Extension:99 were the latest published
-    # on 2026-09-04.
-    Runtime: python3.14
+    # Datadog-Python311:125 / Datadog-Extension:97 are what ran clean here.
+    # For reference when the upgrade is retried: Datadog-Python312/313/314 all
+    # existed at :127, and Datadog-Extension at :99, as of 2026-09-04.
+    Runtime: python3.11
     Timeout: 29
     MemorySize: 128
     Handler: datadog_lambda.handler.handler
@@ -97,7 +116,7 @@ Resources:
     Properties:
       ContentUri: layers/common/
       CompatibleRuntimes:
-        - python3.14
+        - python3.11
 
   # ── Webhook path (Datadog + GitHub Actions) ─────────────────────────────────
 
@@ -113,8 +132,8 @@ Resources:
       CodeUri: functions/webhook_receiver/
       Description: Validates HMAC signatures and forwards payloads to the normalizer
       Layers:
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
       Environment:
         Variables:
           GITHUB_WEBHOOK_SECRET_ARN: !Ref GithubWebhookSecretArn
@@ -155,8 +174,8 @@ Resources:
       Description: Normalises raw alert payloads to the shared incident schema
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
       Environment:
         Variables:
           DEDUP_FUNCTION_NAME: !Ref DedupFunction
@@ -207,8 +226,8 @@ Resources:
       Description: Suppresses duplicate alerts and groups related alerts into incidents
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
       Environment:
         Variables:
           DEDUP_TABLE_NAME: !Ref DeduplicationTable
@@ -307,15 +326,15 @@ Resources:
       # asynchronously, sits behind no API Gateway, and makes a model call, so
       # the cap never applied to it. Real work is 15-23 s.
       #
-      # 60, not the 120 this first carried: the timeout was never the bug
-      # (RC1-385). The function was hanging *after* delivering, so a bigger
-      # budget bought nothing but a bigger bill — 124 s billed per incident
-      # instead of 33. Headroom for a slow model call is all this needs to be.
+      # 60, not the 120 this briefly carried: the timeout was never the bug
+      # (RC1-385). Kept after the revert to python3.11 on its own merit — the
+      # inherited 29 s left almost no margin, and a run at 23.5 s on 09-04 was
+      # one slow model call from the wall.
       Timeout: 60
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
@@ -345,8 +364,8 @@ Resources:
       Description: Posts incident summaries to Slack and maintains thread continuity
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
@@ -376,8 +395,8 @@ Resources:
       Description: Creates Jira tickets for new incidents and writes the ticket ID back to DynamoDB
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
@@ -413,8 +432,8 @@ Resources:
       Description: Posts incident summaries to the Datadog Events API and writes the event ID back to DynamoDB
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
