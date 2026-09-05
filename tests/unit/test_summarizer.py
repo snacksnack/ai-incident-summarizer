@@ -321,3 +321,41 @@ class TestDeliveryClaim:
         with patch("anthropic.Anthropic", _mock_anthropic()):
             with pytest.raises(ClientError):
                 app.handler({"incident_id": "inc-123"}, None)
+
+
+# ── The Anthropic client is reused, not rebuilt (RC1-385) ─────────────────────
+
+class TestClientReuse:
+    """A client built per invocation leaves an httpx connection pool behind
+    each time. On python3.14 that stopped the invocation from ever completing:
+    the handler finished its work in ~16 s and the runtime then sat until the
+    deadline 105 s later, reporting `Exiting: timeout` with nothing in the log
+    to explain it. The handler had succeeded, so no error surfaced — only the
+    REPORT line showed it.
+    """
+
+    def test_client_is_built_once_across_invocations(self, summarizer):
+        app, _, _ = summarizer
+        mock_anthropic = _mock_anthropic()
+        with patch("anthropic.Anthropic", mock_anthropic):
+            app.handler({"incident_id": "inc-123"}, None)
+            app.handler({"incident_id": "inc-123"}, None)
+            app.handler({"incident_id": "inc-123"}, None)
+        assert mock_anthropic.call_count == 1
+
+    def test_client_is_cached_on_the_module(self, summarizer):
+        app, _, _ = summarizer
+        assert app._anthropic_client is None
+        with patch("anthropic.Anthropic", _mock_anthropic()):
+            app.handler({"incident_id": "inc-123"}, None)
+        assert app._anthropic_client is not None
+
+    def test_still_sends_the_model_from_the_env_var_when_reused(self, summarizer):
+        """Reuse must not freeze configuration that is read per call."""
+        app, _, _ = summarizer
+        mock_anthropic = _mock_anthropic()
+        with patch("anthropic.Anthropic", mock_anthropic):
+            app.handler({"incident_id": "inc-123"}, None)
+            app.handler({"incident_id": "inc-123"}, None)
+        for call in mock_anthropic.return_value.messages.create.call_args_list:
+            assert call[1]["model"] == MODEL_ID
