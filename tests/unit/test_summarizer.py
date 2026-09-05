@@ -330,9 +330,9 @@ class TestClientReuse:
     each time and pays for a fresh TLS handshake.
 
     Written while chasing the python3.14 hang (RC1-385) on the theory that the
-    leak was its cause. It was not — the hang survived this unchanged and the
-    runtime went back to python3.11. These tests stay because the reuse is
-    right on its own terms, not because they guard against that bug.
+    leak was its cause. It was not — the cause was the 128 MB memory ceiling,
+    fixed in template.yaml. These tests stay because the reuse is right on its
+    own terms, not because they guard against that bug.
     """
 
     def test_client_is_built_once_across_invocations(self, summarizer):
