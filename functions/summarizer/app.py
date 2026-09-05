@@ -89,19 +89,20 @@ Return only the JSON object. Do not include markdown, code fences, or any other 
 
 
 def _get_anthropic_client() -> anthropic.Anthropic:
-    """One client for the life of the execution environment (RC1-385).
+    """One client for the life of the execution environment.
 
     It used to be constructed inside `_call_llm`, so every invocation left
     another `httpx` connection pool behind and paid for a fresh TLS
     handshake. Reusing it is the same pattern `_get_incident_table` and
     `_api_key_cache` already follow.
 
-    This was written as the fix for the python3.14 hang (RC1-385) on the
-    reasoning that the summarizer was the only function using the Anthropic
-    SDK and the only one hanging. **It was not the fix** — the hang survived
-    it unchanged, and the runtime was reverted to python3.11 instead. Kept
+    History, so nobody re-derives it: this was first written as the fix for
+    the python3.14 hang (RC1-385) on the reasoning that the summarizer was
+    the only function using the Anthropic SDK and the only one hanging. It
+    was not the fix. The hang was the 128 MB memory ceiling — the function
+    needs ~220 MB — and is fixed in template.yaml, not here. This stays
     because leaking a connection pool per invocation is worth not doing on
-    any runtime, but do not mistake it for a diagnosis: RC1-385 is open.
+    any runtime.
     """
     global _anthropic_client
     if _anthropic_client is None:

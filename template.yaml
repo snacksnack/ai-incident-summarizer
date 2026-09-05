@@ -44,49 +44,44 @@ Parameters:
 
 Globals:
   Function:
-    # python3.11 — reverted from python3.14 on 2026-09-05 (RC1-385).
+    # python3.14 on Amazon Linux 2023 (RC1-221, re-applied under RC1-385).
+    # AL2 reached end of life on 2026-06-30 and python3.11 rode it; 3.14
+    # deprecates 2029-06-30, the furthest-out date available. Local .venv,
+    # both CI workflows and this runtime are deliberately the same
+    # interpreter.
     #
-    # RC1-221 moved all seven functions to 3.14 and the chain passed, but
-    # SummarizerFunction stopped completing: it did its work in ~16 s and then
-    # sat until whatever deadline it was given (29 s, then 120 s, then 60 s),
-    # ending in `Exiting: timeout` with no exception and nothing in the log to
-    # explain it. Every incident logged a Lambda error while appearing to
-    # succeed. Two fixes were tried and neither touched it — the timeout was
-    # never the constraint, and reusing the Anthropic client across
-    # invocations changed nothing. Rather than keep guessing on production,
-    # this is back on the runtime that ran clean for six consecutive
-    # invocations. RC1-385 holds the open investigation.
+    # MemorySize is the finding from RC1-385, not a tuning choice. The first
+    # move to 3.14 (2026-09-04) was reverted because SummarizerFunction did
+    # its work in ~16 s and then sat until the deadline with no exception.
+    # Two diagnoses were tried and were wrong (the timeout, the Anthropic
+    # client). The REPORT lines held the answer all along: every summarizer
+    # invocation on record, clean or hung, reported Max Memory Used equal to
+    # the 128 MB it was given, and the six other functions peaked at 118-123
+    # MB on 3.14. The summarizer actually needs ~220 MB; at 128 it finished
+    # its handler by thrashing the page cache and never completed the
+    # post-handler flush. On 3.11 it fit by a hair and took 15-23 s; on 3.14
+    # with 512 MB it takes ~7 s. Verified live on 2026-09-05 on both the
+    # open-incident and recovery paths with tracing on (INC-82). 256 here is
+    # a floor for the small functions; the summarizer overrides it below.
+    # Do not take any function back to 128.
     #
-    # Do not re-attempt the upgrade without first answering "extension or
-    # SDK": deploy the summarizer alone with DD_TRACE_ENABLED=false on 3.14
-    # and see whether the hang survives. python3.12 (AL2023, deprecates
-    # 2028-10-31) is the smaller next step if it turns out to be specific to
-    # 3.14 rather than to AL2023.
-    #
-    # The clock this is running against: python3.11 sits on Amazon Linux 2,
-    # which reached end of life 2026-06-30. AWS patches it for critical AL2
-    # issues until deprecation on 2027-06-30; creates block 2027-07-31 and
-    # updates 2027-08-31. Roughly 22 months of runway — comfortable, not
-    # indefinite.
-    #
-    # The Datadog layer version below is pinned and must move with this line:
-    # the Python version is baked into the *layer name*, and the handler is
-    # Datadog's wrapper, so a mismatch fails at import on the first invocation
-    # of every function behind a green CloudFormation deploy.
+    # The Datadog layer version below is pinned and must move with the
+    # runtime line: the Python version is baked into the *layer name*, and
+    # the handler is Datadog's wrapper, so a mismatch fails at import on the
+    # first invocation of every function behind a green CloudFormation deploy.
     #
     # Finding the latest layer version is not obvious: Datadog's resource
     # policy grants GetLayerVersion but not ListLayerVersions, so `aws lambda
     # list-layer-versions` returns AccessDenied and an unpublished version is
     # indistinguishable from one you cannot read. Probe upward instead:
     #   aws lambda get-layer-version --region us-east-1 \
-    #     --layer-name arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Python311 \
+    #     --layer-name arn:aws:lambda:us-east-1:464622532012:layer:Datadog-Python314 \
     #     --version-number N
-    # Datadog-Python311:125 / Datadog-Extension:97 are what ran clean here.
-    # For reference when the upgrade is retried: Datadog-Python312/313/314 all
-    # existed at :127, and Datadog-Extension at :99, as of 2026-09-04.
-    Runtime: python3.11
+    # Datadog-Python314:127 and Datadog-Extension:99 were the latest published
+    # on 2026-09-04 and are what ran clean on 2026-09-05.
+    Runtime: python3.14
     Timeout: 29
-    MemorySize: 128
+    MemorySize: 256
     Handler: datadog_lambda.handler.handler
     Environment:
       Variables:
@@ -116,7 +111,7 @@ Resources:
     Properties:
       ContentUri: layers/common/
       CompatibleRuntimes:
-        - python3.11
+        - python3.14
 
   # ── Webhook path (Datadog + GitHub Actions) ─────────────────────────────────
 
@@ -132,8 +127,8 @@ Resources:
       CodeUri: functions/webhook_receiver/
       Description: Validates HMAC signatures and forwards payloads to the normalizer
       Layers:
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           GITHUB_WEBHOOK_SECRET_ARN: !Ref GithubWebhookSecretArn
@@ -174,8 +169,8 @@ Resources:
       Description: Normalises raw alert payloads to the shared incident schema
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           DEDUP_FUNCTION_NAME: !Ref DedupFunction
@@ -226,8 +221,8 @@ Resources:
       Description: Suppresses duplicate alerts and groups related alerts into incidents
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           DEDUP_TABLE_NAME: !Ref DeduplicationTable
@@ -324,17 +319,19 @@ Resources:
       # webhook receiver alone — API Gateway caps its integration at 29 s — and
       # every other function inherited it by accident. This one is invoked
       # asynchronously, sits behind no API Gateway, and makes a model call, so
-      # the cap never applied to it. Real work is 15-23 s.
-      #
-      # 60, not the 120 this briefly carried: the timeout was never the bug
-      # (RC1-385). Kept after the revert to python3.11 on its own merit — the
-      # inherited 29 s left almost no margin, and a run at 23.5 s on 09-04 was
-      # one slow model call from the wall.
+      # the cap never applied to it. Kept at 60 although the work is ~7 s now:
+      # one slow model call should not be a timeout.
       Timeout: 60
+      # 512, not the 256 floor in Globals (RC1-385). Measured need is ~220 MB
+      # (Max Memory Used, 2026-09-05, both paths). 256 would leave ~36 MB of
+      # headroom on a function whose whole failure history is a memory
+      # ceiling, and more memory is also more CPU: the run went from 15-23 s
+      # at 128 MB to ~7 s at 512, so the GB-seconds bill barely moved.
+      MemorySize: 512
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
@@ -364,8 +361,8 @@ Resources:
       Description: Posts incident summaries to Slack and maintains thread continuity
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
@@ -395,8 +392,8 @@ Resources:
       Description: Creates Jira tickets for new incidents and writes the ticket ID back to DynamoDB
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
@@ -432,8 +429,8 @@ Resources:
       Description: Posts incident summaries to the Datadog Events API and writes the event ID back to DynamoDB
       Layers:
         - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python311:125
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:97
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
+        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
