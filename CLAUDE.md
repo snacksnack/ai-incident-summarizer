@@ -50,7 +50,9 @@ Each function has its own `requirements.txt`; shared code goes in the layer.
   rather than listing.
 - **Handlers are Datadog-wrapped**: `Handler: datadog_lambda.handler.handler`
   with the real entry point in `DD_LAMBDA_HANDLER`. A function that sets its
-  own `Handler` loses tracing silently.
+  own `Handler` loses tracing silently. LLM Observability rides the same
+  wrapper: `DD_LLMOBS_ENABLED`, `DD_LLMOBS_ML_APP` and `DD_SERVICE` sit in
+  Globals, the last two both `incident-summarizer` (RC1-419); keep them equal.
 - **Secrets live in AWS Secrets Manager**, never in environment variables or
   the template. Secret *shape* matters — a JSON blob and a raw string are not
   interchangeable, and getting it wrong fails only in production (RC1-371).

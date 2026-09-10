@@ -94,6 +94,23 @@ Globals:
         DD_SERVERLESS_LOGS_ENABLED: "true"
         DD_CAPTURE_LAMBDA_PAYLOAD: "false"
         DD_FLUSH_TO_LOG: "false"
+        # LLM Observability (RC1-419). Set here so every function carries the
+        # flags, but only the summarizer makes a model call, so only it emits
+        # LLM Obs spans. No agentless flag: the Datadog Extension on each
+        # function forwards them. ddtrace's anthropic integration already
+        # produced the APM span the fleet SLO reads; this adds the LLM Obs span
+        # beside it, with tokens and cost, so the summarizer appears in the
+        # fleet cost widgets like every other model caller in the estate.
+        DD_LLMOBS_ENABLED: "1"
+        DD_LLMOBS_ML_APP: incident-summarizer
+        # One service name for the stack, equal to the ml_app, so production
+        # spans read service:incident-summarizer and a future eval run differs
+        # only by service (RC1-411). Until 2026-09-10 nothing set DD_SERVICE
+        # and Datadog fell back to the raw function name
+        # (ai-incident-summarizer-summarizerfunction-...), which is where the
+        # APM history before this date sits. POWERTOOLS_SERVICE_NAME never
+        # reached Datadog.
+        DD_SERVICE: incident-summarizer
 
 Resources:
 
