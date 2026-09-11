@@ -6,5 +6,9 @@ anthropic>=0.40
 
 # The shared eval harness. Pinned by tag — if the ruler can move under a run, a
 # changed score no longer says whether the prompt drifted or the measurement did.
-# v0.3.1: prices claude-sonnet-4-6, so this suite's runs carry real cost.
-agent-evals[sql] @ git+https://github.com/snacksnack/agent-evals@v0.3.1
+# v0.3.1 (RC1-267) priced claude-sonnet-4-6, so this suite's runs carry real
+# cost. v0.6.1 (RC1-420) adds the `llmobs` extra, so the run reports to Datadog
+# LLM Observability under the production ml_app, and prices from the corrected
+# snapshot (RC1-401): the first run after the bump is a new baseline, not a
+# comparison with the v0.3.1 runs before it.
+agent-evals[sql,llmobs] @ git+https://github.com/snacksnack/agent-evals@v0.6.1
