@@ -18,6 +18,7 @@ import os
 import sys
 from datetime import UTC, datetime
 
+from agent_evals import llmobs
 from agent_evals.runner import UnknownCase, exit_code, print_result, record_run, select_cases
 
 from evals import fixtures, subject, summarizer
@@ -53,8 +54,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print(f"{len(cases)} case(s) against {summarizer.model()} — this spends money.\n")
+    # RC1-420: billed spend is traced spend. Same ml_app as the Lambda, so the
+    # fleet pane shows one row per app; `service:evals` is what keeps this run
+    # out of the production spend guardrails (RC1-411). A no-op without
+    # DD_API_KEY, so the suite still runs on a bare machine.
+    llmobs.enable("incident-summarizer", service="evals")
     started = datetime.now(UTC)
-    results = [subject.run(c, client) for c in cases]
+    results = []
+    for case in cases:
+        with llmobs.case(case.id, input_data=case.input) as traced:
+            result = subject.run(case, client)
+            traced.record(result)
+        results.append(result)
     for r in results:
         print_result(r)
 
