@@ -385,13 +385,21 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt CloudWatchAlarmEventRule.Arn
 
-  # ── Test alarm (trigger manually with set-alarm-state to verify the rule) ──
+  # ── Self-test alarm ──
+  # Not a production alert source. CloudWatchAlarmEventRule above has no
+  # alarm-name filter, so every alarm in the account already feeds the
+  # pipeline (today: the three stale-ticket-bot alarms). This one exists only
+  # to verify the rule by hand: `aws cloudwatch set-alarm-state --alarm-name
+  # ai-incident-summarizer-test-alarm --state-value ALARM --state-reason test`,
+  # then OK to recover. It watches the ingest function's own Errors metric, so
+  # a real ingest failure would be reported through the failing function; do
+  # not rely on it for that (RC1-435).
 
   TestCloudWatchAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub "${AWS::StackName}-test-alarm"
-      AlarmDescription: Test alarm for EventBridge rule verification (RC1-33)
+      AlarmDescription: Self-test alarm for verifying the EventBridge rule by hand (RC1-33, RC1-435). Not a production alert source.
       Namespace: AWS/Lambda
       MetricName: Errors
       Dimensions:
