@@ -2,7 +2,7 @@
 
 One page, under 6,000 characters so the PR review agent reads it whole. The
 long story is in the README; the hard-won reasons are in `template.yaml`'s
-comments, worth reading before changing anything in `Globals`.
+comments, read them before changing anything in `Globals`.
 
 ## What this is
 
@@ -32,7 +32,7 @@ evals/                the billed agent-evals subject (incident-summary)
 frontend/             Next.js incident history UI, deployed to Vercel
 ```
 
-Each function pins its own `requirements.txt`; shared code goes in the layer.
+Each function pins its own `requirements.txt`; shared code is in the layer.
 
 ## Conventions (hold a change to these)
 
@@ -47,9 +47,8 @@ Each function pins its own `requirements.txt`; shared code goes in the layer.
 - **The Datadog layer version is pinned and must move with the runtime line.**
   The Python version is baked into the *layer name* and the handler is
   Datadog's wrapper, so a mismatch fails at import on the first invocation of
-  every function, behind a green CloudFormation deploy. Datadog's resource
-  policy denies `ListLayerVersions`, so probe upward with `get-layer-version`
-  rather than listing.
+  every function, behind a green CloudFormation deploy. Datadog denies
+  `ListLayerVersions`; probe upward with `get-layer-version`.
 - **Handlers are Datadog-wrapped**: `Handler: datadog_lambda.handler.handler`
   with the real entry point in `DD_LAMBDA_HANDLER`. A function that sets its
   own `Handler` loses tracing silently. LLM Observability rides the same
@@ -58,7 +57,7 @@ Each function pins its own `requirements.txt`; shared code goes in the layer.
 - **Secrets live in AWS Secrets Manager**, never in environment variables or
   the template. Secret *shape* matters: a JSON blob and a raw string are not
   interchangeable, and getting it wrong fails only in production (RC1-371).
-- **Recoveries close, never open.** A resolved alert closes the newest open
+- **Recoveries close, never open.** A resolved alert closes the latest open
   incident for that service holding the same alert, retires the window and
   fingerprint rows, and runs the delivery chain once more with a `recovered`
   flag. A recovery with nothing to close is **dropped**, not turned into an
@@ -79,17 +78,18 @@ Each function pins its own `requirements.txt`; shared code goes in the layer.
 - **The model restates the computed severity**, it does not re-decide it.
   Deterministic Python owns severity, correlation and fingerprinting.
 - **Function `requirements.txt` should pin, not floor.** Floors let two
-  consecutive `sam build`s ship different `anthropic` versions (1.3.0 on 09-04,
-  1.4.0 on 09-05, which pulled in httpx 2). RC1-386 is pinning them; add new
-  dependencies pinned.
+  consecutive `sam build`s ship different `anthropic` versions (RC1-386).
+- **The dashboard has no AWS keys.** Its API routes assume `DashboardReadRole`
+  via Vercel OIDC; a new table it reads is a change to that role's policy
+  in the same PR as the table (RC1-220).
 
 ## Testing
 
 - `python -m pytest tests/ -v` — `tests/unit/` is offline, `tests/integration/`
-  uses moto for DynamoDB. Test deps: `pip install -r tests/requirements-test.txt`.
-- `sam validate --lint` runs in CI and catches template errors that a green
-  deploy would otherwise hide.
-- `python -m evals` is **billed** and needs `ANTHROPIC_API_KEY` plus
+  uses moto for DynamoDB. Deps: `tests/requirements-test.txt`.
+- `sam validate --lint` runs in CI; it catches template errors a green deploy
+  hides.
+- `python -m evals` is **billed**; needs `ANTHROPIC_API_KEY` plus
   `requirements-evals.txt`; it scores the shipped prompt on real output and
   records to the shared agent-evals store as subject `incident-summary`.
 
