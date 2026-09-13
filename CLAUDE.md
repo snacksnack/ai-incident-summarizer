@@ -71,7 +71,7 @@ Each function pins its own `requirements.txt`; shared code goes in the layer.
 - **Delivery is Slack → Jira → Datadog, in-process**, so the Datadog event
   carries both links. Each stage is idempotent about its artifact and writes
   `<stage>_delivered_count`, so a Lambda retry resumes at the first unfinished
-  stage instead of re-posting. Two functions since RC1-431; do not re-split.
+  stage instead of re-posting (RC1-431).
 - **The prompt's JSON clauses are load-bearing.** `_call_llm` parses with a
   bare `json.loads`, so editing the raw-three-field-JSON wording without
   keeping the contract degrades production to the fallback summary. A free
