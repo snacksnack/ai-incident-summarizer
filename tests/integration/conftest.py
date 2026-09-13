@@ -8,8 +8,7 @@ from moto import mock_aws
 from common import aws
 from tests.conftest import load_function_module
 
-DEDUP_TABLE = "integ-dedup-table"
-CORRELATION_TABLE = "integ-correlation-table"
+ALERT_STATE_TABLE = "integ-alert-state-table"
 INCIDENT_TABLE = "integ-incident-table"
 SERVICE_REGISTRY_TABLE = "integ-service-registry-table"
 
@@ -28,17 +27,10 @@ def dynamodb_tables(aws_credentials):
     with mock_aws():
         dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
 
-        dedup_table = dynamodb.create_table(
-            TableName=DEDUP_TABLE,
-            KeySchema=[{"AttributeName": "fingerprint", "KeyType": "HASH"}],
-            AttributeDefinitions=[{"AttributeName": "fingerprint", "AttributeType": "S"}],
-            BillingMode="PAY_PER_REQUEST",
-        )
-
-        window_table = dynamodb.create_table(
-            TableName=CORRELATION_TABLE,
-            KeySchema=[{"AttributeName": "service_key", "KeyType": "HASH"}],
-            AttributeDefinitions=[{"AttributeName": "service_key", "AttributeType": "S"}],
+        state_table = dynamodb.create_table(
+            TableName=ALERT_STATE_TABLE,
+            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
             BillingMode="PAY_PER_REQUEST",
         )
 
@@ -79,15 +71,14 @@ def dynamodb_tables(aws_credentials):
             BillingMode="PAY_PER_REQUEST",
         )
 
-        yield dedup_table, window_table, incident_table
+        yield state_table, incident_table
 
 
 @pytest.fixture()
 def dedup_app(dynamodb_tables, monkeypatch):
     """The ingest function against moto tables; `process_alert` is the entry
     point the normalized alerts go through."""
-    monkeypatch.setenv("DEDUP_TABLE_NAME", DEDUP_TABLE)
-    monkeypatch.setenv("CORRELATION_TABLE_NAME", CORRELATION_TABLE)
+    monkeypatch.setenv("ALERT_STATE_TABLE_NAME", ALERT_STATE_TABLE)
     monkeypatch.setenv("INCIDENT_TABLE_NAME", INCIDENT_TABLE)
     monkeypatch.setenv("SERVICE_REGISTRY_TABLE_NAME", SERVICE_REGISTRY_TABLE)
     monkeypatch.setenv("SUMMARIZER_FUNCTION_NAME", "integ-summarizer")

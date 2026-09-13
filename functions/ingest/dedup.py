@@ -1,9 +1,12 @@
 """Fingerprint suppression, time-window grouping into incidents, and the
 recovery path that closes them.
 
-State is four DynamoDB tables, all reached through `common.aws`:
-the deduplication table (PK fingerprint, TTL), the correlation window table
-(PK service_key, TTL), the incident table and the service registry.
+State is three DynamoDB tables, all reached through `common.aws`: the alert
+state table, the incident table and the service registry. The alert state
+table holds both kinds of transient row under one TTL (RC1-432): `fp#<sha256>`
+rows suppress a repeat of the same alert, `window#<service>` rows group a
+service's alerts into one incident. Both are conditional puts gated on the
+row's own `ttl`, and both are retired by a recovery.
 """
 import logging
 import os
@@ -20,12 +23,16 @@ from common.fingerprint import generate_fingerprint
 logger = logging.getLogger()
 
 
-def _dedup_table():
-    return aws.table("DEDUP_TABLE_NAME")
+def _state_table():
+    return aws.table("ALERT_STATE_TABLE_NAME")
 
 
-def _window_table():
-    return aws.table("CORRELATION_TABLE_NAME")
+def _fingerprint_key(fingerprint: str) -> dict:
+    return {"pk": f"fp#{fingerprint}"}
+
+
+def _window_key(service_key: str) -> dict:
+    return {"pk": f"window#{service_key}"}
 
 
 def _incident_table():
@@ -58,8 +65,9 @@ def process(alert: dict) -> dict | None:
     ttl = now + window_seconds
 
     try:
-        _dedup_table().put_item(
+        _state_table().put_item(
             Item={
+                **_fingerprint_key(fingerprint),
                 "fingerprint": fingerprint,
                 "first_seen_at": datetime.now(timezone.utc).isoformat(),
                 "source": alert["source"],
@@ -71,7 +79,7 @@ def process(alert: dict) -> dict | None:
             # duplicate, or the 5-minute window silently becomes a 2-day one
             # (RC1-372). Same rule the correlation window already applies.
             ConditionExpression=(
-                Attr("fingerprint").not_exists() | Attr("ttl").lte(now)
+                Attr("pk").not_exists() | Attr("ttl").lte(now)
             ),
         )
     except ClientError as e:
@@ -151,8 +159,9 @@ def _group_into_window(alert: dict, window_seconds: int) -> dict:
     summary = _alert_summary(alert)
 
     try:
-        _window_table().put_item(
+        _state_table().put_item(
             Item={
+                **_window_key(service_key),
                 "service_key": service_key,
                 "incident_id": incident_id,
                 "service": service_key,
@@ -163,7 +172,7 @@ def _group_into_window(alert: dict, window_seconds: int) -> dict:
                 "ttl": ttl,
             },
             ConditionExpression=(
-                Attr("service_key").not_exists() | Attr("ttl").lte(now)
+                Attr("pk").not_exists() | Attr("ttl").lte(now)
             ),
         )
         logger.info(
@@ -178,8 +187,8 @@ def _group_into_window(alert: dict, window_seconds: int) -> dict:
             raise
 
     # Window is still open — append to the existing incident
-    response = _window_table().update_item(
-        Key={"service_key": service_key},
+    response = _state_table().update_item(
+        Key=_window_key(service_key),
         UpdateExpression=(
             "SET alert_summaries = list_append(alert_summaries, :s), "
             "last_updated_at = :ts, "
@@ -291,14 +300,14 @@ def _close_incident(alert: dict, incident: dict, fingerprint: str) -> bool:
         raise
 
     try:
-        _window_table().delete_item(
-            Key={"service_key": alert["affected_service"]},
+        _state_table().delete_item(
+            Key=_window_key(alert["affected_service"]),
             ConditionExpression=Attr("incident_id").eq(incident_id),
         )
     except ClientError as e:
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise  # the window already belongs to a newer incident, or is gone
-    _dedup_table().delete_item(Key={"fingerprint": fingerprint})
+    _state_table().delete_item(Key=_fingerprint_key(fingerprint))
     return True
 
 

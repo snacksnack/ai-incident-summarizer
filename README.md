@@ -27,7 +27,7 @@ Two Lambda functions (RC1-431):
 - **Ingest** has two triggers: the HTTP API for the GitHub Actions and Datadog webhooks, and the EventBridge rule for CloudWatch alarm state changes. It authenticates the webhook (GitHub HMAC, Datadog shared-secret header), normalizes any source to one alert schema, suppresses duplicates by fingerprint, groups alerts for a service inside a 5-minute window into one incident (or, for a recovery, closes the matching open incident), writes the incident, and hands its ID to the summarizer with one asynchronous invoke.
 - **Summarizer** reads the incident, asks Claude for a structured summary (or writes a deterministic fallback), then runs the delivery chain in order: Slack thread, Jira ticket, Datadog event. Each stage writes its artifact ID back to the incident and records the generation it delivered, so a retried invocation resumes where it stopped rather than posting again.
 
-State is DynamoDB: a fingerprint table and a correlation-window table (both TTL-gated), the incident table, and a service registry the dashboard's filters read. The Next.js incident history UI on Vercel reads the incident table and registry directly. `docs/architecture.drawio` is the source of the diagram.
+State is DynamoDB: one TTL-gated alert-state table (`fp#` rows that suppress a repeated alert, `window#` rows that group a service's alerts for 5 minutes), the incident table, and a service registry the dashboard's filters read. The Next.js incident history UI on Vercel reads the incident table and registry directly. `docs/architecture.drawio` is the source of the diagram.
 
 ### DynamoDB incident schema
 
@@ -57,7 +57,7 @@ State is DynamoDB: a fingerprint table and a correlation-window table (both TTL-
 
 ```
 ai-incident-summarizer/
-├── template.yaml              # SAM template: two functions, four tables, the HTTP API, the EventBridge rule
+├── template.yaml              # SAM template: two functions, three tables, the HTTP API, the EventBridge rule
 ├── README.md
 ├── CLAUDE.md                  # conventions, one page
 ├── docs/                      # architecture.drawio + the exported PNG
@@ -110,7 +110,7 @@ Set by `template.yaml`; the SAM parameters in `samconfig.toml` supply the values
 | Variable | Function | Description |
 |---|---|---|
 | `GITHUB_WEBHOOK_SECRET_ARN`, `DATADOG_WEBHOOK_SECRET_ARN` | ingest | Secrets Manager ARNs for the webhook secrets |
-| `DEDUP_TABLE_NAME`, `CORRELATION_TABLE_NAME`, `SERVICE_REGISTRY_TABLE_NAME` | ingest | The fingerprint, window and registry tables |
+| `ALERT_STATE_TABLE_NAME`, `SERVICE_REGISTRY_TABLE_NAME` | ingest | The alert-state (fingerprint + window) and registry tables |
 | `CORRELATION_WINDOW_MINUTES` | ingest | Alert grouping window (5) |
 | `SUMMARIZER_FUNCTION_NAME` | ingest | The one async hand-off |
 | `INCIDENT_TABLE_NAME` | both | DynamoDB incident table |
@@ -196,7 +196,7 @@ DD_API_KEY=… DD_APP_KEY=… python scripts/wire_datadog_monitors.py --dry-run 
 |---|---|---|
 | Runtime | Lambda (Python 3.14, Amazon Linux 2023) | Stateless, zero cost at idle, easy to deploy |
 | Function count | Two: ingest, and summarize + deliver (RC1-431) | It began as seven, one per box, joined by five async invokes. The hops shared no failure domain worth isolating and cost retries that double-posted, seven copies of the layer pin and memory floor, and seven APM histories. The natural seams are the synchronous edge work and the asynchronous model-call-plus-delivery. |
-| State management | DynamoDB TTL | Lambda is stateless; window state lives in DynamoDB |
+| State management | DynamoDB TTL | Lambda is stateless; the transient state (fingerprints and correlation windows) lives in one TTL-gated table under `fp#` and `window#` keys (RC1-432), and the condition expressions test `ttl` themselves because the sweep is lazy |
 | Secret management | AWS Secrets Manager | API keys never stored in plain text or env vars |
 | Deployment | AWS SAM | Native AWS tooling, infrastructure-as-code |
 | Observability | Datadog Lambda layer + Extension | APM traces, logs and metrics auto-instrumented; the Claude call also reports to LLM Observability as ml_app `incident-summarizer` with tokens and cost (RC1-419) |

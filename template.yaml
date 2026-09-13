@@ -159,17 +159,14 @@ Resources:
         Variables:
           GITHUB_WEBHOOK_SECRET_ARN: !Ref GithubWebhookSecretArn
           DATADOG_WEBHOOK_SECRET_ARN: !Ref DatadogWebhookSecretArn
-          DEDUP_TABLE_NAME: !Ref DeduplicationTable
-          CORRELATION_TABLE_NAME: !Ref CorrelationWindowTable
+          ALERT_STATE_TABLE_NAME: !Ref AlertStateTable
           INCIDENT_TABLE_NAME: !Ref IncidentTable
           SERVICE_REGISTRY_TABLE_NAME: !Ref ServiceRegistryTable
           SUMMARIZER_FUNCTION_NAME: !Ref SummarizerFunction
           CORRELATION_WINDOW_MINUTES: "5"
       Policies:
         - DynamoDBCrudPolicy:
-            TableName: !Ref DeduplicationTable
-        - DynamoDBCrudPolicy:
-            TableName: !Ref CorrelationWindowTable
+            TableName: !Ref AlertStateTable
         - DynamoDBCrudPolicy:
             TableName: !Ref IncidentTable
         - DynamoDBCrudPolicy:
@@ -199,31 +196,23 @@ Resources:
             Path: /webhook/datadog
             Method: POST
 
-  # ── Deduplication + correlation ─────────────────────────────────────────────
+  # ── Alert state: fingerprints + correlation windows ─────────────────────────
+  # One TTL-gated table for both kinds of transient row (RC1-432): `fp#<sha256>`
+  # rows suppress a repeat of the same alert, `window#<service>` rows group a
+  # service's alerts into one incident for 5 minutes. They were two tables with
+  # the same shape (conditional put gated on the row's own ttl, delete on
+  # recovery); the second table bought nothing but a second name, env var and
+  # policy. Rows live 5 minutes, so nothing was migrated at the cutover.
 
-  DeduplicationTable:
+  AlertStateTable:
     Type: AWS::DynamoDB::Table
     Properties:
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
-        - AttributeName: fingerprint
+        - AttributeName: pk
           AttributeType: S
       KeySchema:
-        - AttributeName: fingerprint
-          KeyType: HASH
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
-
-  CorrelationWindowTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: service_key
-          AttributeType: S
-      KeySchema:
-        - AttributeName: service_key
+        - AttributeName: pk
           KeyType: HASH
       TimeToLiveSpecification:
         AttributeName: ttl
