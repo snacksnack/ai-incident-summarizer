@@ -9,6 +9,7 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from common import aws
+from common import recurrence
 from common.duration import incident_duration
 
 logger = logging.getLogger()
@@ -58,6 +59,12 @@ def _build_message(incident: dict) -> str:
     created_at = incident.get("created_at", "unknown")
 
     header = f"{badge} | {service} | {created_at}"
+    repeat = recurrence.badge(incident)
+    if repeat:
+        header += f" | 🔁 {repeat}"
+        previous = recurrence.previous_ticket(incident)
+        if previous:
+            header += f" (previous: {previous})"
 
     llm_summary = incident.get("llm_summary")
     if llm_summary:

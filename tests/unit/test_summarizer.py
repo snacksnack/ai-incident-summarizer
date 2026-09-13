@@ -219,6 +219,18 @@ class TestPrompt:
         assert "high-error-rate" in prompt
         assert "latency-spike" in prompt
 
+    def test_prompt_mentions_recurrence_when_present(self, summarizer):
+        app, _, _ = summarizer
+        incident = {**INCIDENT, "recurrence": {"count_7d": 6, "previous_incident_id": "p", "previous_created_at": "2024-01-14T10:00:00Z", "previous_jira_ticket_id": "INC-96"}}
+        prompt = app._build_prompt(incident)
+        assert "7th incident this alert has opened" in prompt
+        assert "INC-96" in prompt
+        assert "recurring problem" in prompt
+
+    def test_prompt_is_silent_about_recurrence_for_a_first_occurrence(self, summarizer):
+        app, _, _ = summarizer
+        assert "Recurrence" not in app._build_prompt(INCIDENT)
+
     def test_prompt_includes_time_range(self, summarizer):
         app, _, _ = summarizer
         prompt = app._build_prompt(INCIDENT)

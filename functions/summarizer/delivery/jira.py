@@ -8,6 +8,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 from common import aws
+from common import recurrence
 
 logger = logging.getLogger()
 
@@ -75,6 +76,17 @@ def _build_description(incident: dict) -> dict:
         except (json.JSONDecodeError, KeyError):
             pass
 
+    recurring = recurrence.sentence(incident)
+    if recurring:
+        content = [{"type": "text", "text": f"Recurring: {recurring}", "marks": [{"type": "strong"}]}]
+        previous = recurrence.previous_ticket(incident)
+        if previous:
+            base_url = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
+            url = f"{base_url}/browse/{previous}"
+            content.append({"type": "text", "text": " Previous ticket: "})
+            content.append({"type": "text", "text": previous, "marks": [{"type": "link", "attrs": {"href": url}}]})
+        paragraphs.append({"type": "paragraph", "content": content})
+
     alerts = incident.get("source_alerts", [])
     if alerts:
         bullet_items = [
@@ -114,10 +126,14 @@ def _create_jira_ticket(incident: dict) -> str:
     service = incident["affected_service"]
     incident_id = incident["incident_id"]
 
+    title = f"[{severity.upper()}] {service} — {incident_id}"
+    repeat = recurrence.badge(incident)
+    if repeat:
+        title += f" (recurring: {repeat})"
     payload = {
         "fields": {
             "project": {"key": project_key},
-            "summary": f"[{severity.upper()}] {service} — {incident_id}",
+            "summary": title,
             "description": _build_description(incident),
             "issuetype": {"name": "Bug"},
             "priority": {"name": priority},

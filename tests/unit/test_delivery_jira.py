@@ -131,6 +131,20 @@ class TestJiraApiCall:
         assert "HIGH" in fields["summary"]
         assert "payments-service" in fields["summary"]
 
+    def test_summary_flags_a_repeat(self, jira):
+        mod, _, _ = jira
+        incident = {**INCIDENT_NO_JIRA, "recurrence": {"count_7d": 6, "previous_incident_id": "p", "previous_created_at": "x", "previous_jira_ticket_id": "INC-96"}}
+        _, mock_post = _create(mod, incident)
+        assert mock_post.call_args[1]["json"]["fields"]["summary"].endswith("(recurring: 7th time in 7 days)")
+
+    def test_description_links_the_previous_ticket(self, jira):
+        mod, _, _ = jira
+        incident = {**INCIDENT_NO_JIRA, "recurrence": {"count_7d": 6, "previous_incident_id": "p", "previous_created_at": "2024-01-14T10:00:00Z", "previous_jira_ticket_id": "INC-96"}}
+        _, mock_post = _create(mod, incident)
+        description = json.dumps(mock_post.call_args[1]["json"]["fields"]["description"])
+        assert "Recurring: This is the 7th incident" in description
+        assert f"{JIRA_BASE_URL}/browse/INC-96" in description
+
     def test_project_key_set_correctly(self, jira):
         mod, _, _ = jira
         _, mock_post = _create(mod)

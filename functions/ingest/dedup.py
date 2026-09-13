@@ -12,7 +12,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
@@ -215,22 +215,83 @@ def _group_into_window(alert: dict, window_seconds: int) -> dict:
     }
 
 
+RECURRENCE_WINDOW_DAYS = 7
+
+
+def _recurrence(alert: dict, now: datetime) -> dict | None:
+    """How often this alert has already opened an incident for this service
+    in the last RECURRENCE_WINDOW_DAYS, and which incident was the latest.
+
+    A flapping alarm opens a fresh incident every time it recovers and fires
+    again — the stale-ticket-bot Lambda-errors alarm produced seven identical
+    HIGH incidents on seven weekdays, each summarized as if new (RC1-437).
+    The count lets the summary, the Slack header and the Jira ticket say
+    "7th time this week" and point at the previous ticket.
+
+    Derived data, like the service registry: a failure here is logged and the
+    incident is written without it."""
+    cutoff = (now - timedelta(days=RECURRENCE_WINDOW_DAYS)).isoformat()
+    try:
+        response = _incident_table().query(
+            IndexName="service-created-index",
+            KeyConditionExpression=(
+                Key("affected_service").eq(alert["affected_service"]) & Key("created_at").gte(cutoff)
+            ),
+            ScanIndexForward=False,
+            Limit=50,
+        )
+    except Exception:
+        logger.warning(
+            "Recurrence lookup failed for affected_service=%s alert_name=%s — incident is written without it",
+            alert["affected_service"], alert["alert_name"], exc_info=True,
+        )
+        return None
+
+    matches = [
+        incident for incident in response.get("Items", [])
+        if any(
+            a.get("source") == alert["source"] and a.get("alert_name") == alert["alert_name"]
+            for a in incident.get("source_alerts", [])
+        )
+    ]
+    if not matches:
+        return None
+    previous = matches[0]
+    recurrence = {
+        "count_7d": len(matches),
+        "previous_incident_id": previous["incident_id"],
+        "previous_created_at": previous.get("created_at"),
+    }
+    if previous.get("jira_ticket_id"):
+        recurrence["previous_jira_ticket_id"] = previous["jira_ticket_id"]
+    return recurrence
+
+
 def _persist_incident(alert: dict, grouping: dict) -> None:
     incident_id = grouping["incident_id"]
     summary = _alert_summary(alert)
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
 
     if grouping["is_new"]:
+        item = {
+            "incident_id": incident_id,
+            "affected_service": alert["affected_service"],
+            "severity": alert["severity"],
+            "status": "open",
+            "source_alerts": [summary],
+            "created_at": now_iso,
+        }
+        recurrence = _recurrence(alert, now)
+        if recurrence:
+            item["recurrence"] = recurrence
+            logger.info(
+                "Recurring alert: alert_name=%s service=%s count_7d=%s previous=%s",
+                alert["alert_name"], alert["affected_service"], recurrence["count_7d"], recurrence["previous_incident_id"],
+            )
         try:
             _incident_table().put_item(
-                Item={
-                    "incident_id": incident_id,
-                    "affected_service": alert["affected_service"],
-                    "severity": alert["severity"],
-                    "status": "open",
-                    "source_alerts": [summary],
-                    "created_at": now_iso,
-                },
+                Item=item,
                 ConditionExpression="attribute_not_exists(incident_id)",
             )
             logger.info("Persisted new incident: incident_id=%s", incident_id)

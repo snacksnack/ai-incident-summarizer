@@ -230,6 +230,12 @@ class TestPayload:
         tags = _posted_event(mod, incident)["tags"]
         assert not any(t.startswith("monitor_id:") for t in tags)
 
+    def test_recurrence_tag_carries_the_occurrence_number(self, dd):
+        mod, _, _ = dd
+        incident = {**INCIDENT, "recurrence": {"count_7d": 6, "previous_incident_id": "p", "previous_created_at": "x"}}
+        assert "recurrence_7d:7" in _posted_event(mod, incident)["tags"]
+        assert not any(t.startswith("recurrence_7d:") for t in _posted_event(mod)["tags"])
+
     def test_no_jira_tag_before_the_ticket_exists(self, dd):
         mod, _, _ = dd
         tags = _posted_event(mod, INCIDENT_NO_LINKS)["tags"]

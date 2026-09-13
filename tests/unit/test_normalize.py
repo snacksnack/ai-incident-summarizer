@@ -348,3 +348,48 @@ class TestUnknownSource:
     def test_missing_source_returns_none(self, normalizer):
         result = _run(normalizer, {"data": "some payload"})
         assert result is None
+
+
+# ── CloudWatch service naming (RC1-437) ──────────────────────────────────────
+
+class TestCloudWatchServiceName:
+    def test_lambda_physical_name_reduces_to_its_stack(self, normalizer):
+        # The real stale-ticket-bot alarm, the first production CloudWatch
+        # traffic this pipeline saw (RC1-435).
+        result = _run(normalizer, _cw_event(
+            alarm_name="stale-ticket-bot-lambda-errors",
+            dimension_value="stale-ticket-bot-StaleTicketBotFunction-G8cd3Ax5XBMd",
+        ))
+        assert result["affected_service"] == "stale-ticket-bot"
+
+    def test_queue_physical_name_reduces_to_its_stack(self, normalizer):
+        event = _cw_event(alarm_name="ai-incident-summarizer-ingest-dlq-depth-high")
+        metric = event["detail"]["configuration"]["metrics"][0]["metricStat"]["metric"]
+        metric.update({"namespace": "AWS/SQS", "name": "ApproximateNumberOfMessagesVisible",
+                       "dimensions": {"QueueName": "ai-incident-summarizer-IngestDLQ-CHgswNqI8tXR"}})
+        result = _run(normalizer, event)
+        assert result["affected_service"] == "ai-incident-summarizer"
+
+    def test_thirteen_character_suffix_also_matches(self, normalizer):
+        assert normalizer.service_from_resource_name(
+            "ai-incident-summarizer-ServiceRegistryTable-1J75C4WMWXHHB"
+        ) == "ai-incident-summarizer"
+
+    def test_plain_dimension_value_is_kept(self, normalizer):
+        result = _run(normalizer, _cw_event(dimension_value="payments-service"))
+        assert result["affected_service"] == "payments-service"
+
+    @pytest.mark.parametrize("name", [
+        "payments-service-v2",              # no random suffix
+        "my-service-Function-abc",          # suffix too short
+        "stale-ticket-bot-function-G8cd3Ax5XBMd",  # logical id not capitalised
+        "StaleTicketBotFunction-G8cd3Ax5XBMd",     # no stack prefix
+    ])
+    def test_non_cloudformation_names_pass_through(self, normalizer, name):
+        assert normalizer.service_from_resource_name(name) == name
+
+    def test_alarm_without_dimensions_falls_back_to_alarm_name(self, normalizer):
+        event = _cw_event(alarm_name="BillingAlarm")
+        event["detail"]["configuration"]["metrics"][0]["metricStat"]["metric"]["dimensions"] = {}
+        result = _run(normalizer, event)
+        assert result["affected_service"] == "BillingAlarm"

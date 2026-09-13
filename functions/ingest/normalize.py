@@ -83,15 +83,35 @@ def _normalize_cloudwatch(event: dict) -> NormalizedAlert:
     )
 
 
+# A CloudFormation-named resource: <stack>-<LogicalId>-<12-13 random chars>,
+# e.g. stale-ticket-bot-StaleTicketBotFunction-G8cd3Ax5XBMd or
+# ai-incident-summarizer-IngestDLQ-CHgswNqI8tXR. The stack is the service.
+_CFN_PHYSICAL_NAME = re.compile(r"^(?P<stack>.+)-(?P<logical>[A-Z][A-Za-z0-9]*)-(?P<suffix>[A-Za-z0-9]{12,13})$")
+
+
 def _cloudwatch_service(detail: dict, alarm_name: str) -> str:
+    """The alarm's first metric dimension, reduced to the stack name when it
+    is a CloudFormation-generated physical name; the alarm name when there
+    are no dimensions.
+
+    Before RC1-437 the raw dimension value was the service, so the first real
+    CloudWatch traffic registered `stale-ticket-bot-StaleTicketBotFunction-
+    G8cd3Ax5XBMd` as a service in the dashboard's filter list. Every stack in
+    this account is SAM-deployed, so the physical name's shape is the one
+    stable clue to which system an alarm belongs to."""
     try:
         metrics = detail["configuration"]["metrics"]
         dims = metrics[0]["metricStat"]["metric"]["dimensions"]
         if dims:
-            return next(iter(dims.values()))
+            return service_from_resource_name(next(iter(dims.values())))
     except (KeyError, IndexError, StopIteration):
         pass
     return alarm_name
+
+
+def service_from_resource_name(name: str) -> str:
+    match = _CFN_PHYSICAL_NAME.match(name)
+    return match.group("stack") if match else name
 
 
 def _cloudwatch_severity(alarm_name: str, state_value: str) -> str:
