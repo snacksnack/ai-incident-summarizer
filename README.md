@@ -13,46 +13,21 @@ Built with AWS Lambda (Python), SAM, DynamoDB, Claude, Next.js, and Vercel.
 | Source | Role | Integration |
 |---|---|---|
 | **CloudWatch** | AWS infrastructure alarms (Lambda errors, timeouts, throttles) | Native EventBridge |
-| **Datadog** | APM and application-level alerts (error rates, latency, service health) | Webhook via API Gateway |
+| **Datadog** | Synthetics uptime and TLS checks, CI Visibility (deploy and pipeline failures) and the LLM spend monitors; see `scripts/wire_datadog_monitors.py` for the exact set | Webhook via API Gateway |
 | **GitHub Actions** | CI/CD pipeline failures — only `workflow_run.completed` events; a failed run opens an incident, a successful one is a recovery that closes it; in-progress runs, `workflow_job` and `push` deliveries are ignored | Webhook via API Gateway |
 
 ---
 
 ## Architecture
 
-```
-CloudWatch          Datadog             GitHub Actions
-    │                   │                     │
-    ▼                   ▼                     ▼
-EventBridge        API Gateway (HMAC validation)
-    │                        │
-    └──────────┬─────────────┘
-               ▼
-        Lambda normalizer
-        (stateless · shared schema)
-               │
-               ▼
-    ┌─── Dedup + correlation ────────────────┐
-    │  Fingerprinting → Time-window grouping │
-    │  State store: DynamoDB TTL             │
-    │  Recovery → closes the open incident   │
-    │  (or is dropped if there is none)      │
-    └────────────────────────────────────────┘
-               │
-        ┌──────┴──────┐
-        ▼             ▼
-    DynamoDB      LLM summarizer
-    (persist      (Claude / GPT-4o)
-    raw incident) │
-        ▲         ├──► Slack    ──► write back thread_id
-        │         ├──► Jira     ──► write back ticket_id
-        │         └──► Datadog  ──► write back event_id
-        │              (Events API — the summary lands on the
-        │               timeline beside the monitors that fed it)
-        │
-        ▼
-  Incident history UI
-```
+![Architecture](docs/architecture.png)
+
+Two Lambda functions (RC1-431):
+
+- **Ingest** has two triggers: the HTTP API for the GitHub Actions and Datadog webhooks, and the EventBridge rule for CloudWatch alarm state changes. It authenticates the webhook (GitHub HMAC, Datadog shared-secret header), normalizes any source to one alert schema, suppresses duplicates by fingerprint, groups alerts for a service inside a 5-minute window into one incident (or, for a recovery, closes the matching open incident), writes the incident, and hands its ID to the summarizer with one asynchronous invoke.
+- **Summarizer** reads the incident, asks Claude for a structured summary (or writes a deterministic fallback), then runs the delivery chain in order: Slack thread, Jira ticket, Datadog event. Each stage writes its artifact ID back to the incident and records the generation it delivered, so a retried invocation resumes where it stopped rather than posting again.
+
+State is DynamoDB: a fingerprint table and a correlation-window table (both TTL-gated), the incident table, and a service registry the dashboard's filters read. The Next.js incident history UI on Vercel reads the incident table and registry directly. `docs/architecture.drawio` is the source of the diagram.
 
 ### DynamoDB incident schema
 
@@ -82,44 +57,40 @@ EventBridge        API Gateway (HMAC validation)
 
 ```
 ai-incident-summarizer/
-├── template.yaml              # SAM template
+├── template.yaml              # SAM template: two functions, four tables, the HTTP API, the EventBridge rule
 ├── README.md
-├── .gitignore
-├── events/                    # Sample payloads for local testing
+├── CLAUDE.md                  # conventions, one page
+├── docs/                      # architecture.drawio + the exported PNG
+├── events/                    # Sample payloads for `sam local invoke`
 │   ├── cloudwatch.json
 │   ├── datadog.json
 │   └── github-actions.json
 ├── functions/
-│   ├── normalizer/            # Alert normalizer Lambda
-│   │   ├── app.py
+│   ├── ingest/                # HTTP API + EventBridge → one incident hand-off
+│   │   ├── app.py             # routes by event shape; the async invoke of the summarizer
+│   │   ├── webhook.py         # GitHub HMAC / Datadog shared-secret validation
+│   │   ├── normalize.py       # any source → the shared alert schema
+│   │   ├── dedup.py           # fingerprinting, time-window grouping, recovery close
 │   │   └── requirements.txt
-│   ├── dedup/                 # Fingerprinting + time-window grouping
-│   │   ├── app.py
-│   │   └── requirements.txt
-│   ├── summarizer/            # LLM summarizer
-│   │   ├── app.py
-│   │   └── requirements.txt
-│   ├── slack/                 # Slack delivery
-│   │   ├── app.py
-│   │   └── requirements.txt
-│   ├── jira/                  # Jira ticket creation
-│   │   ├── app.py
-│   │   └── requirements.txt
-│   └── datadog_events/        # Datadog Events API write-back
-│       ├── app.py
+│   └── summarizer/            # Claude summary, then the delivery chain
+│       ├── app.py             # prompt, model call, fallback, per-stage delivery markers
+│       ├── delivery/          # slack.py, jira.py, datadog_events.py — in that order
 │       └── requirements.txt
 ├── layers/
 │   └── common/                # Shared Lambda layer
 │       └── python/
 │           └── common/
-│               ├── schema.py  # Normalised alert schema
-│               └── dynamo.py  # DynamoDB client helpers
+│               ├── schema.py       # Normalized alert schema
+│               ├── aws.py          # DynamoDB table + Secrets Manager caches
+│               ├── fingerprint.py  # SHA-256 alert identity
+│               └── duration.py     # human-readable incident duration
+├── evals/                     # the billed agent-evals subject (incident-summary)
+├── scripts/                   # Datadog webhook + monitor wiring, dashboard seed, registry backfill
+├── frontend/                  # Next.js incident history UI, deployed to Vercel
 └── tests/
     ├── unit/
-    └── integration/
+    └── integration/           # moto-backed DynamoDB
 ```
-
----
 
 ## Prerequisites
 
@@ -134,20 +105,20 @@ ai-incident-summarizer/
 
 ## Environment variables
 
-| Variable | Description |
-|---|---|
-| `DYNAMODB_TABLE` | DynamoDB incident table name |
-| `DD_API_KEY_SECRET_ARN` | Secrets Manager ARN for Datadog API key |
-| `SLACK_BOT_TOKEN_SECRET_ARN` | Secrets Manager ARN for Slack bot token |
-| `SLACK_CHANNEL_ID` | Target Slack channel for incident alerts |
-| `JIRA_API_TOKEN_SECRET_ARN` | Secrets Manager ARN for Jira API token |
-| `JIRA_BASE_URL` | Your Jira instance URL |
-| `JIRA_PROJECT_KEY` | Jira project key for incident tickets |
-| `INCIDENT_DASHBOARD_URL` | Base URL of the incident history UI, linked from Datadog events (empty omits the link) |
-| `LLM_PROVIDER` | `claude` or `openai` |
-| `CORRELATION_WINDOW_MINUTES` | Alert grouping window in minutes (default: 5) |
+Set by `template.yaml`; the SAM parameters in `samconfig.toml` supply the values.
 
----
+| Variable | Function | Description |
+|---|---|---|
+| `GITHUB_WEBHOOK_SECRET_ARN`, `DATADOG_WEBHOOK_SECRET_ARN` | ingest | Secrets Manager ARNs for the webhook secrets |
+| `DEDUP_TABLE_NAME`, `CORRELATION_TABLE_NAME`, `SERVICE_REGISTRY_TABLE_NAME` | ingest | The fingerprint, window and registry tables |
+| `CORRELATION_WINDOW_MINUTES` | ingest | Alert grouping window (5) |
+| `SUMMARIZER_FUNCTION_NAME` | ingest | The one async hand-off |
+| `INCIDENT_TABLE_NAME` | both | DynamoDB incident table |
+| `ANTHROPIC_API_KEY_SECRET_ARN`, `MODEL_ID` | summarizer | The Claude call |
+| `SLACK_BOT_TOKEN_SECRET_ARN`, `SLACK_CHANNEL_ID` | summarizer | Slack delivery |
+| `JIRA_API_TOKEN_SECRET_ARN`, `JIRA_BASE_URL`, `JIRA_PROJECT_KEY`, `JIRA_USER_EMAIL` | summarizer | Jira delivery |
+| `INCIDENT_DASHBOARD_URL` | summarizer | Linked from Datadog events (empty omits the link) |
+| `DD_API_KEY_SECRET_ARN`, `DD_*`, `POWERTOOLS_SERVICE_NAME` | both (Globals) | Datadog wrapper, tracing and LLM Observability; the Datadog events writer reuses the same key |
 
 ## Local development
 
@@ -156,7 +127,7 @@ ai-incident-summarizer/
 sam build
 
 # Run a function locally with a sample event
-sam local invoke NormalizerFunction --event events/datadog.json
+sam local invoke IngestFunction --event events/cloudwatch.json
 
 # Deploy to AWS
 sam deploy --guided
@@ -211,7 +182,7 @@ DD_API_KEY=… DD_APP_KEY=… python scripts/configure_datadog_webhook.py
 
 To notify the pipeline, add `@webhook-incident-summarizer` to a monitor's message. Monitor **318762066** ("incident-summarizer webhook test signal") exists for exactly that: push `incident_summarizer.test_signal` = 1 to trigger it, 0 to recover.
 
-**Which real monitors notify it.** `scripts/wire_datadog_monitors.py` is the source of truth (RC1-375): eight monitors that mean a real outage and rarely flap — the five synthetics checks on www.hihelloreid.com and incidents.hihelloreid.com (uptime, /work render, TLS expiry), the two CI Visibility monitors (production deploy failed, CI pipeline failed) and the daily LLM spend guardrail. Each gets the webhook handle appended to its message, a `service:` tag (`hihelloreid.com`, `incidents.hihelloreid.com`, `delivery-pipeline`, `agent-fleet`) so the incident is filed under a service rather than `unknown`, and a priority (P2 for the two uptime checks and the deploy monitor, P3 for the rest), since `$ALERT_PRIORITY` sets incident severity. The six Program KPI monitors and the seven host-pack monitors are deliberately left out — the KPI sim keeps a monitor tripped by script for weeks, and each alert would be a Slack post, an INC ticket and a model call. Synthetics-backed monitors reject monitor-API edits, so the script writes their message, tags and priority to the synthetics test instead. Re-run it after a monitor is recreated or edited by hand; it changes nothing that already matches:
+**Which real monitors notify it.** `scripts/wire_datadog_monitors.py` is the source of truth (RC1-375): nine monitors that mean a real outage and rarely flap — the five synthetics checks on www.hihelloreid.com and incidents.hihelloreid.com (uptime, /work render, TLS expiry), the two CI Visibility monitors (production deploy failed, CI pipeline failed) and the two LLM spend monitors (the daily guardrail and the cost-per-call price signal, RC1-377). Each gets the webhook handle appended to its message, a `service:` tag (`hihelloreid.com`, `incidents.hihelloreid.com`, `delivery-pipeline`, `agent-fleet`) so the incident is filed under a service rather than `unknown`, and a priority (P2 for the two uptime checks and the deploy monitor, P3 for the rest), since `$ALERT_PRIORITY` sets incident severity. The six Program KPI monitors and the seven host-pack monitors are deliberately left out — the KPI sim keeps a monitor tripped by script for weeks, and each alert would be a Slack post, an INC ticket and a model call. Synthetics-backed monitors reject monitor-API edits, so the script writes their message, tags and priority to the synthetics test instead. Re-run it after a monitor is recreated or edited by hand; it changes nothing that already matches:
 
 ```bash
 DD_API_KEY=… DD_APP_KEY=… python scripts/wire_datadog_monitors.py --dry-run   # then without --dry-run
@@ -224,12 +195,14 @@ DD_API_KEY=… DD_APP_KEY=… python scripts/wire_datadog_monitors.py --dry-run 
 | Decision | Choice | Rationale |
 |---|---|---|
 | Runtime | Lambda (Python 3.14, Amazon Linux 2023) | Stateless, zero cost at idle, easy to deploy |
+| Function count | Two: ingest, and summarize + deliver (RC1-431) | It began as seven, one per box, joined by five async invokes. The hops shared no failure domain worth isolating and cost retries that double-posted, seven copies of the layer pin and memory floor, and seven APM histories. The natural seams are the synchronous edge work and the asynchronous model-call-plus-delivery. |
 | State management | DynamoDB TTL | Lambda is stateless; window state lives in DynamoDB |
 | Secret management | AWS Secrets Manager | API keys never stored in plain text or env vars |
 | Deployment | AWS SAM | Native AWS tooling, infrastructure-as-code |
 | Observability | Datadog Lambda layer + Extension | APM traces, logs and metrics auto-instrumented; the Claude call also reports to LLM Observability as ml_app `incident-summarizer` with tokens and cost (RC1-419) |
 | Recoveries | Close, never open | A resolved alert (CloudWatch OK, Datadog Recovered, GitHub success) closes the newest open incident for that service holding the same alert, retires the window and fingerprint rows so the next alert starts fresh, and runs the delivery chain once more with a `recovered` flag: Slack reply in the thread, Jira comment plus a Done-category transition when the workflow offers one, Datadog `success` event on the same aggregation key. A recovery with nothing to close is dropped. |
-| Datadog write-back | Events API v1, last stop in the delivery chain | The chain is summarizer → Slack → Jira → Datadog so the event carries both links. Each stage is idempotent about its own artifact (thread, ticket) and always hands off, so a re-summary of a live incident reaches the timeline too; `aggregation_key` rolls those up under one row. Reuses the Lambda extension's API key secret — Datadog API keys carry no scopes, so there is no narrower key to mint. |
+| Delivery chain | Slack → Jira → Datadog, in one function | The order is a sequencing constraint (the Datadog event carries both links), not a reason for three functions. Each stage is idempotent about its own artifact and records `<stage>_delivered_count`, so a Lambda retry of the summarizer resumes at the first unfinished stage instead of re-posting; a re-summary of a live incident (a new alert in the window) is a new generation and delivers again. |
+| Datadog write-back | Events API v1, last stop in the delivery chain | The summary that came out of Datadog's alerts goes back in as an event, so the timeline shows it beside the raw monitors; `aggregation_key` rolls re-summaries and the recovery up under one row. Reuses the Lambda extension's API key secret — Datadog API keys carry no scopes, so there is no narrower key to mint. |
 | Incident history UI | Next.js on Vercel | Next.js API routes call DynamoDB directly as Vercel serverless functions — no API Gateway needed. A single `vercel deploy` produces a shareable URL. React handles the dashboard UI. Chosen over a static S3 + API Gateway approach for simplicity and to gain practical exposure to Vercel, which is widely used in the industry. |
 
 ---

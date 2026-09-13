@@ -1,19 +1,15 @@
+"""Jira: one ticket per incident, created once; the recovery comments on it and
+moves it to a Done-category status when the workflow offers one."""
 import json
 import logging
 import os
 
-import boto3
 import requests
 from requests.auth import HTTPBasicAuth
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+from common import aws
 
-_secrets_client = boto3.client("secretsmanager")
-_lambda_client = boto3.client("lambda")
-_dynamodb = boto3.resource("dynamodb")
-_incident_table = None
-_token_cache: dict[str, str] = {}
+logger = logging.getLogger()
 
 _PRIORITY_MAP = {
     "critical": "Highest",
@@ -23,18 +19,34 @@ _PRIORITY_MAP = {
 }
 
 
-def _get_incident_table():
-    global _incident_table
-    if _incident_table is None:
-        _incident_table = _dynamodb.Table(os.environ["INCIDENT_TABLE_NAME"])
-    return _incident_table
+def deliver(incident: dict, recovered: bool = False) -> str | None:
+    """Create the ticket, or on recovery close it; return its key (None if none)."""
+    incident_id = incident["incident_id"]
+
+    if recovered:
+        if incident.get("jira_ticket_id"):
+            _close_jira_ticket(incident)
+        else:
+            logger.info("Incident %s resolved with no Jira ticket to close", incident_id)
+        return incident.get("jira_ticket_id")
+
+    if incident.get("jira_ticket_id"):
+        logger.info("Incident %s already has jira_ticket_id %s, skipping", incident_id, incident["jira_ticket_id"])
+        return incident["jira_ticket_id"]
+
+    ticket_key = _create_jira_ticket(incident)
+    aws.table("INCIDENT_TABLE_NAME").update_item(
+        Key={"incident_id": incident_id},
+        UpdateExpression="SET jira_ticket_id = :k",
+        ExpressionAttributeValues={":k": ticket_key},
+    )
+    incident["jira_ticket_id"] = ticket_key
+    logger.info("Jira ticket %s created for incident %s", ticket_key, incident_id)
+    return ticket_key
 
 
 def _get_api_token() -> str:
-    arn = os.environ["JIRA_API_TOKEN_SECRET_ARN"]
-    if arn not in _token_cache:
-        _token_cache[arn] = _token_from_secret(_secrets_client.get_secret_value(SecretId=arn)["SecretString"])
-    return _token_cache[arn]
+    return _token_from_secret(aws.secret(os.environ["JIRA_API_TOKEN_SECRET_ARN"]))
 
 
 def _token_from_secret(secret_string: str) -> str:
@@ -141,7 +153,7 @@ def _recovery_comment(incident: dict) -> dict:
 def _close_jira_ticket(incident: dict) -> None:
     """Comment the recovery on the ticket and move it to a Done-category status
     if the project's workflow offers one from here. Both best effort: a Jira
-    hiccup must not stop the hand-off to Datadog."""
+    hiccup must not stop the Datadog event that follows."""
     base_url = os.environ["JIRA_BASE_URL"].rstrip("/")
     auth = HTTPBasicAuth(os.environ["JIRA_USER_EMAIL"], _get_api_token())
     key = incident["jira_ticket_id"]
@@ -166,55 +178,3 @@ def _close_jira_ticket(incident: dict) -> None:
         logger.info("Transitioned %s to %s", key, done.get("name"))
     else:
         logger.error("Jira rejected transition %s on %s (%s): %s", done.get("name"), key, resp.status_code, resp.text[:300])
-
-
-def _invoke_datadog_events(incident_id: str, recovered: bool = False) -> None:
-    # Last stop in the delivery chain. Runs whether the ticket was created just
-    # now or already existed, so every re-summary of a live incident reaches
-    # Datadog's timeline with both the Slack and Jira links in hand.
-    payload = {"incident_id": incident_id}
-    if recovered:
-        payload["recovered"] = True
-    _lambda_client.invoke(
-        FunctionName=os.environ["DATADOG_EVENTS_FUNCTION_NAME"],
-        InvocationType="Event",
-        Payload=json.dumps(payload),
-    )
-    logger.info("Datadog events writer invoked for incident %s", incident_id)
-
-
-def handler(event: dict, context) -> dict | None:
-    incident_id = event.get("incident_id")
-    if not incident_id:
-        logger.error("No incident_id in event")
-        return None
-
-    table = _get_incident_table()
-    response = table.get_item(Key={"incident_id": incident_id})
-    incident = response.get("Item")
-    if not incident:
-        logger.warning("Incident %s not found", incident_id)
-        return None
-
-    if event.get("recovered"):
-        if incident.get("jira_ticket_id"):
-            _close_jira_ticket(incident)
-        else:
-            logger.info("Incident %s resolved with no Jira ticket to close", incident_id)
-        _invoke_datadog_events(incident_id, recovered=True)
-        return {"incident_id": incident_id, "jira_ticket_id": incident.get("jira_ticket_id"), "resolved": True}
-
-    if incident.get("jira_ticket_id"):
-        logger.info("Incident %s already has jira_ticket_id %s, skipping", incident_id, incident["jira_ticket_id"])
-        _invoke_datadog_events(incident_id)
-        return {"incident_id": incident_id, "jira_ticket_id": incident["jira_ticket_id"]}
-
-    ticket_key = _create_jira_ticket(incident)
-    table.update_item(
-        Key={"incident_id": incident_id},
-        UpdateExpression="SET jira_ticket_id = :k",
-        ExpressionAttributeValues={":k": ticket_key},
-    )
-    logger.info("Jira ticket %s created for incident %s", ticket_key, incident_id)
-    _invoke_datadog_events(incident_id)
-    return {"incident_id": incident_id, "jira_ticket_id": ticket_key}

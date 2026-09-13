@@ -1,5 +1,0 @@
-# Pinned to the resolution that passed the 09-05 chain test (RC1-386). Floors
-# let every `sam build` ship whatever was current that day — the 09-04 build
-# took anthropic 1.3.0, the 09-05 build 1.4.0. Bump these deliberately.
-
-boto3==1.43.89

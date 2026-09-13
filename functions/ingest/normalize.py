@@ -1,16 +1,14 @@
-import json
-import logging
-import os
-import re
+"""Any alert source to the shared alert schema (`common.schema.NormalizedAlert`).
 
-import boto3
+Deterministic Python owns service, severity and status here; the model only
+restates them later.
+"""
+import logging
+import re
 
 from common.schema import NormalizedAlert
 
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-
-_lambda_client = boto3.client("lambda")
 
 _SEVERITY_KEYWORDS = ["critical", "high", "medium", "low"]
 
@@ -32,7 +30,13 @@ _GH_SUCCESS_CONCLUSIONS = {"success", "skipped", "neutral"}
 _GH_SEVERITY_MAP = {"failure": "high", "timed_out": "high", "startup_failure": "high", "cancelled": "medium"}
 
 
-def handler(event: dict, context) -> dict | None:
+def normalize(event: dict) -> NormalizedAlert | None:
+    """The alert an inbound event describes, or None when it is not one.
+
+    None covers an unknown source, a payload that cannot be normalized (logged
+    and discarded, never raised: a malformed alert must not poison the
+    function) and a GitHub delivery that is not a completed workflow run.
+    """
     source = _detect_source(event)
     if source is None:
         logger.warning("Discarding event with unknown source: %s", event.get("source"))
@@ -40,27 +44,13 @@ def handler(event: dict, context) -> dict | None:
 
     try:
         if source == "cloudwatch":
-            alert = _normalize_cloudwatch(event)
-        elif source == "datadog":
-            alert = _normalize_datadog(event)
-        else:
-            alert = _normalize_github(event)
+            return _normalize_cloudwatch(event)
+        if source == "datadog":
+            return _normalize_datadog(event)
+        return _normalize_github(event)
     except Exception:
         logger.exception("Failed to normalize %s event, discarding", source)
         return None
-
-    if alert is None:
-        return None
-
-    logger.info("Normalized alert: %s", json.dumps(alert.to_dict()))
-
-    _lambda_client.invoke(
-        FunctionName=os.environ["DEDUP_FUNCTION_NAME"],
-        InvocationType="Event",
-        Payload=json.dumps(alert.to_dict()),
-    )
-
-    return alert.to_dict()
 
 
 def _detect_source(event: dict) -> str | None:

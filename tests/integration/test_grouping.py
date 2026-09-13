@@ -25,7 +25,7 @@ def _make_alert(service, source="cloudwatch", alert_name="cpu-alarm", n=0):
 class TestBurstGrouping:
     def test_four_alerts_same_service_share_incident(self, dedup_app):
         alerts = [_make_alert("payments-service", alert_name=f"alarm-{i}", n=i) for i in range(4)]
-        results = [dedup_app.handler(a, None) for a in alerts]
+        results = [dedup_app.process_alert(a) for a in alerts]
 
         assert all(r is not None for r in results)
         incident_ids = {r["incident_id"] for r in results}
@@ -35,8 +35,8 @@ class TestBurstGrouping:
 
 class TestServiceIsolation:
     def test_different_services_produce_different_incidents(self, dedup_app):
-        result_a = dedup_app.handler(_make_alert("payments-service"), None)
-        result_b = dedup_app.handler(_make_alert("checkout-service"), None)
+        result_a = dedup_app.process_alert(_make_alert("payments-service"))
+        result_b = dedup_app.process_alert(_make_alert("checkout-service"))
 
         assert result_a is not None
         assert result_b is not None
@@ -48,7 +48,7 @@ class TestServiceIsolation:
 class TestPersistence:
     def test_new_incident_written_to_dynamodb_with_status_open(self, dedup_app, dynamodb_tables):
         _, _, incident_table = dynamodb_tables
-        result = dedup_app.handler(_make_alert("payments-service"), None)
+        result = dedup_app.process_alert(_make_alert("payments-service"))
         item = incident_table.get_item(Key={"incident_id": result["incident_id"]})["Item"]
         assert item["status"] == "open"
         assert item["affected_service"] == "payments-service"
@@ -58,17 +58,17 @@ class TestPersistence:
         _, _, incident_table = dynamodb_tables
         alert1 = _make_alert("payments-service", alert_name="alarm-1", n=0)
         alert2 = _make_alert("payments-service", alert_name="alarm-2", n=1)
-        result1 = dedup_app.handler(alert1, None)
-        dedup_app.handler(alert2, None)
+        result1 = dedup_app.process_alert(alert1)
+        dedup_app.process_alert(alert2)
         item = incident_table.get_item(Key={"incident_id": result1["incident_id"]})["Item"]
         assert len(item["source_alerts"]) == 2
 
     def test_idempotent_write_does_not_duplicate_incident(self, dedup_app, dynamodb_tables):
         _, _, incident_table = dynamodb_tables
         alert = _make_alert("payments-service")
-        result = dedup_app.handler(alert, None)
+        result = dedup_app.process_alert(alert)
         # Manually call _persist_incident again with is_new=True to simulate a race
-        dedup_app._persist_incident(alert, {"incident_id": result["incident_id"], "is_new": True})
+        dedup_app.dedup._persist_incident(alert, {"incident_id": result["incident_id"], "is_new": True})
         item = incident_table.get_item(Key={"incident_id": result["incident_id"]})["Item"]
         assert len(item["source_alerts"]) == 1  # still only one
 
@@ -79,8 +79,8 @@ class TestWindowExpiry:
         alert2 = _make_alert("orders-service", alert_name="alarm-2")
         alert3 = _make_alert("orders-service", alert_name="alarm-3")
 
-        result1 = dedup_app.handler(alert1, None)
-        result2 = dedup_app.handler(alert2, None)
+        result1 = dedup_app.process_alert(alert1)
+        result2 = dedup_app.process_alert(alert2)
 
         assert result1["is_new"] is True
         assert result2["is_new"] is False
@@ -89,10 +89,8 @@ class TestWindowExpiry:
         # Advance time past the TTL
         window_seconds = 5 * 60
         future = int(time.time()) + window_seconds + 10
-        with patch("functions.dedup.app.time") if False else patch("time.time", return_value=future):
-            dedup_app._table = None
-            dedup_app._window_table = None
-            result3 = dedup_app.handler(alert3, None)
+        with patch("time.time", return_value=future):
+            result3 = dedup_app.process_alert(alert3)
 
         assert result3["is_new"] is True
         assert result3["incident_id"] != result1["incident_id"]
@@ -122,12 +120,12 @@ class TestDedupExpiry:
         alert = _make_alert("payments-service", alert_name="error-rate")
         self._seed_fingerprint(dedup_app, dynamodb_tables, alert, ttl=int(time.time()) - 3600)
 
-        result = dedup_app.handler(alert, None)
+        result = dedup_app.process_alert(alert)
 
         assert result is not None
         assert result["is_new"] is True
         dedup_table, _, _ = dynamodb_tables
-        row = dedup_table.get_item(Key={"fingerprint": dedup_app.generate_fingerprint(
+        row = dedup_table.get_item(Key={"fingerprint": dedup_app.dedup.generate_fingerprint(
             source=alert["source"], alert_name=alert["alert_name"], affected_service=alert["affected_service"],
         )})["Item"]
         assert int(row["ttl"]) > int(time.time())  # row refreshed, not just tolerated
@@ -136,17 +134,17 @@ class TestDedupExpiry:
         alert = _make_alert("payments-service", alert_name="error-rate")
         self._seed_fingerprint(dedup_app, dynamodb_tables, alert, ttl=int(time.time()) + 120)
 
-        assert dedup_app.handler(alert, None) is None
+        assert dedup_app.process_alert(alert) is None
         dedup_app._lambda_client.invoke.assert_not_called()
 
     def test_same_alert_again_after_window_is_accepted(self, dedup_app):
         alert = _make_alert("payments-service", alert_name="error-rate")
-        first = dedup_app.handler(alert, None)
+        first = dedup_app.process_alert(alert)
         assert first["is_new"] is True
 
         future = int(time.time()) + 5 * 60 + 10
         with patch("time.time", return_value=future):
-            again = dedup_app.handler(alert, None)
+            again = dedup_app.process_alert(alert)
 
         assert again is not None
         assert again["is_new"] is True
@@ -162,8 +160,8 @@ class TestRecoveryClosesIncident:
 
     def test_recovery_marks_incident_resolved_and_appends_alert(self, dedup_app, dynamodb_tables):
         alert = _make_alert("payments-service", alert_name="error-rate")
-        opened = dedup_app.handler(alert, None)
-        closed = dedup_app.handler(self._recovery(alert), None)
+        opened = dedup_app.process_alert(alert)
+        closed = dedup_app.process_alert(self._recovery(alert))
 
         assert closed["resolved"] is True
         assert closed["incident_id"] == opened["incident_id"]
@@ -175,46 +173,46 @@ class TestRecoveryClosesIncident:
 
     def test_recovery_hands_off_to_summarizer_with_flag(self, dedup_app):
         alert = _make_alert("payments-service", alert_name="error-rate")
-        dedup_app.handler(alert, None)
-        dedup_app.handler(self._recovery(alert), None)
+        dedup_app.process_alert(alert)
+        dedup_app.process_alert(self._recovery(alert))
         payloads = [json.loads(c[1]["Payload"]) for c in dedup_app._lambda_client.invoke.call_args_list]
         assert payloads[-1]["recovered"] is True
 
     def test_recovery_retires_window_and_fingerprint_rows(self, dedup_app, dynamodb_tables):
         alert = _make_alert("payments-service", alert_name="error-rate")
-        dedup_app.handler(alert, None)
-        dedup_app.handler(self._recovery(alert), None)
+        dedup_app.process_alert(alert)
+        dedup_app.process_alert(self._recovery(alert))
         dedup_table, window_table, _ = dynamodb_tables
         assert "Item" not in window_table.get_item(Key={"service_key": "payments-service"})
-        fp = dedup_app.generate_fingerprint(source=alert["source"], alert_name=alert["alert_name"],
+        fp = dedup_app.dedup.generate_fingerprint(source=alert["source"], alert_name=alert["alert_name"],
                                             affected_service=alert["affected_service"])
         assert "Item" not in dedup_table.get_item(Key={"fingerprint": fp})
 
     def test_new_alert_after_recovery_opens_a_new_incident(self, dedup_app):
         alert = _make_alert("payments-service", alert_name="error-rate")
-        first = dedup_app.handler(alert, None)
-        dedup_app.handler(self._recovery(alert), None)
-        again = dedup_app.handler({**alert, "alert_id": "alert-payments-service-2"}, None)
+        first = dedup_app.process_alert(alert)
+        dedup_app.process_alert(self._recovery(alert))
+        again = dedup_app.process_alert({**alert, "alert_id": "alert-payments-service-2"})
         assert again["is_new"] is True
         assert again["incident_id"] != first["incident_id"]
 
     def test_recovery_without_open_incident_is_dropped(self, dedup_app, dynamodb_tables):
         alert = _make_alert("payments-service", alert_name="error-rate")
-        assert dedup_app.handler(self._recovery(alert), None) is None
+        assert dedup_app.process_alert(self._recovery(alert)) is None
         _, _, incident_table = dynamodb_tables
         assert incident_table.scan()["Count"] == 0
         dedup_app._lambda_client.invoke.assert_not_called()
 
     def test_second_recovery_is_dropped(self, dedup_app):
         alert = _make_alert("payments-service", alert_name="error-rate")
-        dedup_app.handler(alert, None)
-        assert dedup_app.handler(self._recovery(alert), None)["resolved"] is True
-        assert dedup_app.handler(self._recovery(alert), None) is None
+        dedup_app.process_alert(alert)
+        assert dedup_app.process_alert(self._recovery(alert))["resolved"] is True
+        assert dedup_app.process_alert(self._recovery(alert)) is None
 
     def test_recovery_of_other_alert_does_not_close_incident(self, dedup_app, dynamodb_tables):
         alert = _make_alert("payments-service", alert_name="error-rate")
-        opened = dedup_app.handler(alert, None)
+        opened = dedup_app.process_alert(alert)
         other = _make_alert("payments-service", alert_name="latency")
-        assert dedup_app.handler(self._recovery(other), None) is None
+        assert dedup_app.process_alert(self._recovery(other)) is None
         _, _, incident_table = dynamodb_tables
         assert incident_table.get_item(Key={"incident_id": opened["incident_id"]})["Item"]["status"] == "open"

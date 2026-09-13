@@ -1,15 +1,17 @@
-import importlib
 import os
-import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import boto3
 import pytest
 from moto import mock_aws
 
+from common import aws
+from tests.conftest import load_function_module
+
 DEDUP_TABLE = "integ-dedup-table"
 CORRELATION_TABLE = "integ-correlation-table"
 INCIDENT_TABLE = "integ-incident-table"
+SERVICE_REGISTRY_TABLE = "integ-service-registry-table"
 
 
 @pytest.fixture()
@@ -70,28 +72,30 @@ def dynamodb_tables(aws_credentials):
             BillingMode="PAY_PER_REQUEST",
         )
 
+        dynamodb.create_table(
+            TableName=SERVICE_REGISTRY_TABLE,
+            KeySchema=[{"AttributeName": "affected_service", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "affected_service", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+
         yield dedup_table, window_table, incident_table
 
 
 @pytest.fixture()
 def dedup_app(dynamodb_tables, monkeypatch):
+    """The ingest function against moto tables; `process_alert` is the entry
+    point the normalized alerts go through."""
     monkeypatch.setenv("DEDUP_TABLE_NAME", DEDUP_TABLE)
     monkeypatch.setenv("CORRELATION_TABLE_NAME", CORRELATION_TABLE)
     monkeypatch.setenv("INCIDENT_TABLE_NAME", INCIDENT_TABLE)
+    monkeypatch.setenv("SERVICE_REGISTRY_TABLE_NAME", SERVICE_REGISTRY_TABLE)
     monkeypatch.setenv("SUMMARIZER_FUNCTION_NAME", "integ-summarizer")
     monkeypatch.setenv("CORRELATION_WINDOW_MINUTES", "5")
 
-    for mod in list(sys.modules):
-        if mod == "app" or mod.startswith("app."):
-            del sys.modules[mod]
-
-    sys.path.insert(0, "functions/dedup")
-    import app
-    importlib.reload(app)
-
-    app._table = None
-    app._window_table = None
-    app._incident_table = None
+    aws.reset()  # inside mock_aws, so the resource it builds is moto's
+    with patch("boto3.client"):
+        app = load_function_module("ingest")
     app._lambda_client = MagicMock()
 
     yield app

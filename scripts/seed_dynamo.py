@@ -602,7 +602,7 @@ def seed() -> None:
 
 
 def _seed_service_registry(incidents: list) -> None:
-    """Mirror the dedup Lambda's registry write for seeded incidents.
+    """Mirror the ingest function's registry write for seeded incidents.
 
     The dashboard reads its service filters from the registry, so seeding
     incidents without seeding the registry leaves the filters empty.
@@ -626,7 +626,7 @@ def _seed_service_registry(incidents: list) -> None:
     registry = dynamodb.Table(REGISTRY_TABLE_NAME)
     print(f"\nWriting {len(seen)} services to {REGISTRY_TABLE_NAME}...")
     for service, entry in sorted(seen.items()):
-        # Matches the dedup Lambda: last_seen_at always advances, first_seen_at
+        # Matches the ingest function: last_seen_at always advances, first_seen_at
         # is only set the first time the service is seen.
         registry.update_item(
             Key={"affected_service": service},

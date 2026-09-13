@@ -78,14 +78,14 @@ class TestFixturesMirrorDedup:
         mutable and the fixtures (and the severity check built on them) need
         rethinking — which is exactly the conversation this test forces.
         """
-        source = (summarizer.REPO_ROOT / "functions" / "dedup" / "app.py").read_text()
+        source = (summarizer.REPO_ROOT / "functions" / "ingest" / "dedup.py").read_text()
         expressions = re.findall(r"UpdateExpression=\((.*?)\)", source, flags=re.DOTALL)
         assert expressions, "dedup no longer builds an UpdateExpression — re-read the append path"
         for expression in expressions:
             assert "severity" not in expression
 
     def test_severities_are_the_normalizer_vocabulary(self):
-        source = (summarizer.REPO_ROOT / "functions" / "normalizer" / "app.py").read_text()
+        source = (summarizer.REPO_ROOT / "functions" / "ingest" / "normalize.py").read_text()
         match = re.search(r"_SEVERITY_KEYWORDS = \[(.*?)\]", source)
         assert match, "normalizer no longer declares _SEVERITY_KEYWORDS"
         shipped = tuple(re.findall(r'"(\w+)"', match.group(1)))

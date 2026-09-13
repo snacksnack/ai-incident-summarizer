@@ -56,14 +56,14 @@ Globals:
     # Two diagnoses were tried and were wrong (the timeout, the Anthropic
     # client). The REPORT lines held the answer all along: every summarizer
     # invocation on record, clean or hung, reported Max Memory Used equal to
-    # the 128 MB it was given, and the six other functions peaked at 118-123
+    # the 128 MB it was given, and the six other functions of the time peaked at 118-123
     # MB on 3.14. The summarizer actually needs ~220 MB; at 128 it finished
     # its handler by thrashing the page cache and never completed the
     # post-handler flush. On 3.11 it fit by a hair and took 15-23 s; on 3.14
     # with 512 MB it takes ~7 s. Verified live on 2026-09-05 on both the
     # open-incident and recovery paths with tracing on (INC-82). 256 here is
-    # a floor for the small functions; the summarizer overrides it below.
-    # Do not take any function back to 128.
+    # a floor (the ingest function inherits it); the summarizer overrides it
+    # below. Do not take any function back to 128.
     #
     # The Datadog layer version below is pinned and must move with the
     # runtime line: the Python version is baked into the *layer name*, and
@@ -80,6 +80,8 @@ Globals:
     # Datadog-Python314:127 and Datadog-Extension:99 were the latest published
     # on 2026-09-04 and are what ran clean on 2026-09-05.
     Runtime: python3.14
+    # 29 s is API Gateway's integration cap and applies to the ingest
+    # function, which sits behind it. The summarizer overrides it below.
     Timeout: 29
     MemorySize: 256
     Handler: datadog_lambda.handler.handler
@@ -94,7 +96,7 @@ Globals:
         DD_SERVERLESS_LOGS_ENABLED: "true"
         DD_CAPTURE_LAMBDA_PAYLOAD: "false"
         DD_FLUSH_TO_LOG: "false"
-        # LLM Observability (RC1-419). Set here so every function carries the
+        # LLM Observability (RC1-419). Set here so both functions carry the
         # flags, but only the summarizer makes a model call, so only it emits
         # LLM Obs spans. No agentless flag: the Datadog Extension on each
         # function forwards them. ddtrace's anthropic integration already
@@ -130,28 +132,48 @@ Resources:
       CompatibleRuntimes:
         - python3.14
 
-  # ── Webhook path (Datadog + GitHub Actions) ─────────────────────────────────
+  # ── Ingest: webhooks (Datadog + GitHub Actions) and CloudWatch via EventBridge ──
+  #
+  # One function for everything alert-shaped (RC1-431). It used to be three
+  # (webhook receiver → normalizer → dedup) joined by async invokes; they
+  # shared no failure domain worth isolating, and the whole path is a few
+  # DynamoDB writes, well inside API Gateway's 29 s cap. The EventBridge rule
+  # and the two HTTP routes all target this function.
 
   WebhookApi:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: prod
-      Description: Receives inbound webhooks from Datadog and GitHub Actions
+      Description: Receives inbound webhooks from Datadog and GitHub Actions and hands them to the ingest function
 
-  WebhookReceiverFunction:
+  IngestFunction:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: functions/webhook_receiver/
-      Description: Validates HMAC signatures and forwards payloads to the normalizer
+      CodeUri: functions/ingest/
+      Description: Authenticates webhooks, normalizes every alert source, deduplicates and groups alerts into incidents, and hands each touched incident to the summarizer
       Layers:
+        - !Ref CommonLayer
         - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
         - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
           GITHUB_WEBHOOK_SECRET_ARN: !Ref GithubWebhookSecretArn
           DATADOG_WEBHOOK_SECRET_ARN: !Ref DatadogWebhookSecretArn
-          NORMALIZER_FUNCTION_NAME: !Ref NormalizerFunction
+          DEDUP_TABLE_NAME: !Ref DeduplicationTable
+          CORRELATION_TABLE_NAME: !Ref CorrelationWindowTable
+          INCIDENT_TABLE_NAME: !Ref IncidentTable
+          SERVICE_REGISTRY_TABLE_NAME: !Ref ServiceRegistryTable
+          SUMMARIZER_FUNCTION_NAME: !Ref SummarizerFunction
+          CORRELATION_WINDOW_MINUTES: "5"
       Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DeduplicationTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CorrelationWindowTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ServiceRegistryTable
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
@@ -162,7 +184,7 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: lambda:InvokeFunction
-              Resource: !GetAtt NormalizerFunction.Arn
+              Resource: !GetAtt SummarizerFunction.Arn
       Events:
         GithubWebhook:
           Type: HttpApi
@@ -176,30 +198,6 @@ Resources:
             ApiId: !Ref WebhookApi
             Path: /webhook/datadog
             Method: POST
-
-  # ── Normalizer ──────────────────────────────────────────────────────────────
-
-  NormalizerFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: functions/normalizer/
-      Description: Normalises raw alert payloads to the shared incident schema
-      Layers:
-        - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
-      Environment:
-        Variables:
-          DEDUP_FUNCTION_NAME: !Ref DedupFunction
-      Policies:
-        - Statement:
-            - Effect: Allow
-              Action: secretsmanager:GetSecretValue
-              Resource: !Ref DatadogApiKeySecretArn
-        - Statement:
-            - Effect: Allow
-              Action: lambda:InvokeFunction
-              Resource: !GetAtt DedupFunction.Arn
 
   # ── Deduplication + correlation ─────────────────────────────────────────────
 
@@ -230,41 +228,6 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
-
-  DedupFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: functions/dedup/
-      Description: Suppresses duplicate alerts and groups related alerts into incidents
-      Layers:
-        - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
-      Environment:
-        Variables:
-          DEDUP_TABLE_NAME: !Ref DeduplicationTable
-          CORRELATION_TABLE_NAME: !Ref CorrelationWindowTable
-          INCIDENT_TABLE_NAME: !Ref IncidentTable
-          SERVICE_REGISTRY_TABLE_NAME: !Ref ServiceRegistryTable
-          SUMMARIZER_FUNCTION_NAME: !Ref SummarizerFunction
-          CORRELATION_WINDOW_MINUTES: "5"
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref DeduplicationTable
-        - DynamoDBCrudPolicy:
-            TableName: !Ref CorrelationWindowTable
-        - DynamoDBCrudPolicy:
-            TableName: !Ref IncidentTable
-        - DynamoDBCrudPolicy:
-            TableName: !Ref ServiceRegistryTable
-        - Statement:
-            - Effect: Allow
-              Action: secretsmanager:GetSecretValue
-              Resource: !Ref DatadogApiKeySecretArn
-        - Statement:
-            - Effect: Allow
-              Action: lambda:InvokeFunction
-              Resource: !GetAtt SummarizerFunction.Arn
 
   # ── Incident store ───────────────────────────────────────────────────────────
 
@@ -325,20 +288,30 @@ Resources:
         - AttributeName: affected_service
           KeyType: HASH
 
-  # ── LLM summarizer ──────────────────────────────────────────────────────────
+  # ── Summarize + deliver ─────────────────────────────────────────────────────
+  #
+  # The model call and the whole delivery chain, in one function (RC1-431):
+  # Claude, then Slack, then Jira, then the Datadog event timeline, in that
+  # order so the event carries both links. Slack, Jira and Datadog used to be
+  # three more functions joined by async invokes; the ordering is a sequencing
+  # constraint, not a reason for three functions, and each stage was already
+  # idempotent about its own artifact. Each stage now also records the
+  # generation it delivered, so a retried invocation resumes where it stopped
+  # instead of posting the earlier stages again.
 
   SummarizerFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: functions/summarizer/
-      Description: Summarizes grouped incidents using Claude via the Anthropic API
-      # Overrides the 29 s in Globals (RC1-384). That number exists for the
-      # webhook receiver alone — API Gateway caps its integration at 29 s — and
-      # every other function inherited it by accident. This one is invoked
-      # asynchronously, sits behind no API Gateway, and makes a model call, so
-      # the cap never applied to it. Kept at 60 although the work is ~7 s now:
-      # one slow model call should not be a timeout.
-      Timeout: 60
+      Description: Summarizes an incident with Claude and delivers it to Slack, Jira and the Datadog event timeline
+      # Overrides the 29 s in Globals (RC1-384). That number is API Gateway's
+      # integration cap and belongs to the ingest function; this one is
+      # invoked asynchronously and sits behind no API Gateway. The model call
+      # is ~7 s; the delivery chain adds Slack (three attempts with backoff),
+      # up to three Jira calls and one Datadog call, each with a 10 s HTTP
+      # timeout. 90 leaves room for one slow stage without turning it into a
+      # Lambda timeout and a retry.
+      Timeout: 90
       # 512, not the 256 floor in Globals (RC1-385). Measured need is ~220 MB
       # (Max Memory Used, 2026-09-05, both paths). 256 would leave ~36 MB of
       # headroom on a function whose whole failure history is a memory
@@ -354,7 +327,13 @@ Resources:
           INCIDENT_TABLE_NAME: !Ref IncidentTable
           ANTHROPIC_API_KEY_SECRET_ARN: !Ref AnthropicApiKeySecretArn
           MODEL_ID: claude-sonnet-4-6
-          SLACK_NOTIFIER_FUNCTION_NAME: !Ref SlackNotifierFunction
+          SLACK_BOT_TOKEN_SECRET_ARN: !Ref SlackBotTokenSecretArn
+          SLACK_CHANNEL_ID: !Ref SlackChannelId
+          JIRA_API_TOKEN_SECRET_ARN: !Ref JiraApiTokenSecretArn
+          JIRA_BASE_URL: !Ref JiraBaseUrl
+          JIRA_PROJECT_KEY: !Ref JiraProjectKey
+          JIRA_USER_EMAIL: !Ref JiraUserEmail
+          INCIDENT_DASHBOARD_URL: !Ref IncidentDashboardUrl
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref IncidentTable
@@ -363,117 +342,24 @@ Resources:
               Action: secretsmanager:GetSecretValue
               Resource:
                 - !Ref AnthropicApiKeySecretArn
-                - !Ref DatadogApiKeySecretArn
-        - Statement:
-            - Effect: Allow
-              Action: lambda:InvokeFunction
-              Resource: !GetAtt SlackNotifierFunction.Arn
-
-  # ── Slack notifier ───────────────────────────────────────────────────────────
-
-  SlackNotifierFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: functions/slack_notifier/
-      Description: Posts incident summaries to Slack and maintains thread continuity
-      Layers:
-        - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
-      Environment:
-        Variables:
-          INCIDENT_TABLE_NAME: !Ref IncidentTable
-          SLACK_BOT_TOKEN_SECRET_ARN: !Ref SlackBotTokenSecretArn
-          SLACK_CHANNEL_ID: !Ref SlackChannelId
-          JIRA_CREATOR_FUNCTION_NAME: !Ref JiraCreatorFunction
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref IncidentTable
-        - Statement:
-            - Effect: Allow
-              Action: secretsmanager:GetSecretValue
-              Resource:
                 - !Ref SlackBotTokenSecretArn
-                - !Ref DatadogApiKeySecretArn
-        - Statement:
-            - Effect: Allow
-              Action: lambda:InvokeFunction
-              Resource: !GetAtt JiraCreatorFunction.Arn
-
-  # ── Jira ticket creator ──────────────────────────────────────────────────────
-
-  JiraCreatorFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: functions/jira_creator/
-      Description: Creates Jira tickets for new incidents and writes the ticket ID back to DynamoDB
-      Layers:
-        - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
-      Environment:
-        Variables:
-          INCIDENT_TABLE_NAME: !Ref IncidentTable
-          JIRA_API_TOKEN_SECRET_ARN: !Ref JiraApiTokenSecretArn
-          JIRA_BASE_URL: !Ref JiraBaseUrl
-          JIRA_PROJECT_KEY: !Ref JiraProjectKey
-          JIRA_USER_EMAIL: !Ref JiraUserEmail
-          SLACK_CHANNEL_ID: !Ref SlackChannelId
-          DATADOG_EVENTS_FUNCTION_NAME: !Ref DatadogEventsFunction
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref IncidentTable
-        - Statement:
-            - Effect: Allow
-              Action: secretsmanager:GetSecretValue
-              Resource:
                 - !Ref JiraApiTokenSecretArn
+                # The Datadog events writer reuses the extension's API key
+                # secret: Datadog API keys carry no scopes.
                 - !Ref DatadogApiKeySecretArn
-        - Statement:
-            - Effect: Allow
-              Action: lambda:InvokeFunction
-              Resource: !GetAtt DatadogEventsFunction.Arn
-
-  # ── Datadog events writer ────────────────────────────────────────────────────
-  # Closes the loop: the summary that came out of Datadog's alerts goes back in
-  # as an event, so the timeline shows the LLM summary beside the raw monitors.
-  # Reuses the extension's API key secret — Datadog API keys carry no scopes.
-
-  DatadogEventsFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: functions/datadog_events/
-      Description: Posts incident summaries to the Datadog Events API and writes the event ID back to DynamoDB
-      Layers:
-        - !Ref CommonLayer
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Python314:127
-        - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
-      Environment:
-        Variables:
-          INCIDENT_TABLE_NAME: !Ref IncidentTable
-          SLACK_CHANNEL_ID: !Ref SlackChannelId
-          JIRA_BASE_URL: !Ref JiraBaseUrl
-          INCIDENT_DASHBOARD_URL: !Ref IncidentDashboardUrl
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref IncidentTable
-        - Statement:
-            - Effect: Allow
-              Action: secretsmanager:GetSecretValue
-              Resource: !Ref DatadogApiKeySecretArn
 
   # ── CloudWatch → EventBridge path ──────────────────────────────────────────
 
-  NormalizerDLQ:
+  IngestDLQ:
     Type: AWS::SQS::Queue
     Properties:
       MessageRetentionPeriod: 1209600  # 14 days
 
-  NormalizerDLQPolicy:
+  IngestDLQPolicy:
     Type: AWS::SQS::QueuePolicy
     Properties:
       Queues:
-        - !Ref NormalizerDLQ
+        - !Ref IngestDLQ
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -481,7 +367,7 @@ Resources:
             Principal:
               Service: events.amazonaws.com
             Action: sqs:SendMessage
-            Resource: !GetAtt NormalizerDLQ.Arn
+            Resource: !GetAtt IngestDLQ.Arn
             Condition:
               ArnEquals:
                 aws:SourceArn: !GetAtt CloudWatchAlarmEventRule.Arn
@@ -489,7 +375,7 @@ Resources:
   CloudWatchAlarmEventRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: Routes CloudWatch alarm state changes to the normalizer Lambda
+      Description: Routes CloudWatch alarm state changes to the ingest Lambda
       EventPattern:
         source:
           - aws.cloudwatch
@@ -497,15 +383,15 @@ Resources:
           - CloudWatch Alarm State Change
       State: ENABLED
       Targets:
-        - Id: NormalizerTarget
-          Arn: !GetAtt NormalizerFunction.Arn
+        - Id: IngestTarget
+          Arn: !GetAtt IngestFunction.Arn
           DeadLetterConfig:
-            Arn: !GetAtt NormalizerDLQ.Arn
+            Arn: !GetAtt IngestDLQ.Arn
 
-  NormalizerEventBridgePermission:
+  IngestEventBridgePermission:
     Type: AWS::Lambda::Permission
     Properties:
-      FunctionName: !GetAtt NormalizerFunction.Arn
+      FunctionName: !GetAtt IngestFunction.Arn
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt CloudWatchAlarmEventRule.Arn
@@ -521,7 +407,7 @@ Resources:
       MetricName: Errors
       Dimensions:
         - Name: FunctionName
-          Value: !Ref NormalizerFunction
+          Value: !Ref IngestFunction
       Statistic: Sum
       Period: 60
       EvaluationPeriods: 1
@@ -538,9 +424,9 @@ Outputs:
     Description: Base URL for the webhook API endpoint (includes the stage)
     Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${WebhookApiprodStage}"
 
-  NormalizerDLQUrl:
-    Description: SQS DLQ URL for failed EventBridge-to-normalizer deliveries
-    Value: !Ref NormalizerDLQ
+  IngestDLQUrl:
+    Description: SQS DLQ URL for failed EventBridge-to-ingest deliveries
+    Value: !Ref IngestDLQ
 
   IncidentTableName:
     Description: DynamoDB incident table name

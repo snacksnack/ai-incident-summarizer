@@ -2,7 +2,7 @@
 
 One page, under 6,000 characters so the PR review agent reads it whole. The
 long story is in the README; the hard-won reasons are in `template.yaml`'s
-comments, which are worth reading before changing anything in `Globals`.
+comments, worth reading before changing anything in `Globals`.
 
 ## What this is
 
@@ -15,22 +15,24 @@ incident history UI on Vercel reads DynamoDB directly.
 ## Layout
 
 ```
-template.yaml         SAM: seven functions, tables, API, the Globals block
-functions/
-  webhook_receiver/   HMAC / shared-secret validation at the edge
-  normalizer/         any source -> the shared alert schema
-  dedup/              fingerprint, time-window grouping, recovery close
-  summarizer/         the Claude call and the fallback summary
-  slack_notifier/ jira_creator/ datadog_events/    the delivery chain
+template.yaml         SAM: two functions, tables, API, the Globals block
+functions/ingest/     HTTP API + EventBridge in, one async invoke out
+  app.py              routes by event shape
+  webhook.py          HMAC / shared-secret validation at the edge
+  normalize.py        any source -> the shared alert schema
+  dedup.py            fingerprint, time-window grouping, recovery close
+functions/summarizer/
+  app.py              Claude call, fallback, delivery loop
+  delivery/           slack.py jira.py datadog_events.py, in that order
 layers/common/python/common/
-  schema.py dynamo.py fingerprint.py duration.py
+  schema.py aws.py fingerprint.py duration.py
 events/               sample payloads for `sam local invoke`
 tests/unit/ tests/integration/   pytest; integration uses moto
 evals/                the billed agent-evals subject (incident-summary)
 frontend/             Next.js incident history UI, deployed to Vercel
 ```
 
-Each function has its own `requirements.txt`; shared code goes in the layer.
+Each function pins its own `requirements.txt`; shared code goes in the layer.
 
 ## Conventions (hold a change to these)
 
@@ -52,9 +54,9 @@ Each function has its own `requirements.txt`; shared code goes in the layer.
   with the real entry point in `DD_LAMBDA_HANDLER`. A function that sets its
   own `Handler` loses tracing silently. LLM Observability rides the same
   wrapper: `DD_LLMOBS_ENABLED`, `DD_LLMOBS_ML_APP` and `DD_SERVICE` sit in
-  Globals, the last two both `incident-summarizer` (RC1-419); keep them equal.
+  Globals, the last two both `incident-summarizer` (RC1-419); keep equal.
 - **Secrets live in AWS Secrets Manager**, never in environment variables or
-  the template. Secret *shape* matters — a JSON blob and a raw string are not
+  the template. Secret *shape* matters: a JSON blob and a raw string are not
   interchangeable, and getting it wrong fails only in production (RC1-371).
 - **Recoveries close, never open.** A resolved alert closes the newest open
   incident for that service holding the same alert, retires the window and
@@ -66,11 +68,10 @@ Each function has its own `requirements.txt`; shared code goes in the layer.
   must test `ttl` itself: `Attr("...").not_exists() | Attr("ttl").lte(now)`.
   Trusting the sweep turned a 5-minute dedup window into "5 minutes to 2 days"
   (RC1-372).
-- **The delivery chain is summarizer → Slack → Jira → Datadog**, in that order,
-  so the Datadog event carries both links. Every stage is idempotent about its
-  own artifact (thread, ticket, event) and **always hands off**, so a
-  re-summary of a live incident still reaches the timeline; `aggregation_key`
-  rolls those up under one row.
+- **Delivery is Slack → Jira → Datadog, in-process**, so the Datadog event
+  carries both links. Each stage is idempotent about its artifact and writes
+  `<stage>_delivered_count`, so a Lambda retry resumes at the first unfinished
+  stage instead of re-posting. Two functions since RC1-431; do not re-split.
 - **The prompt's JSON clauses are load-bearing.** `_call_llm` parses with a
   bare `json.loads`, so editing the raw-three-field-JSON wording without
   keeping the contract degrades production to the fallback summary. A free
@@ -95,7 +96,7 @@ Each function has its own `requirements.txt`; shared code goes in the layer.
 ## Commands
 
 ```bash
-sam build && sam local invoke NormalizerFunction -e events/cloudwatch.json
+sam build && sam local invoke IngestFunction -e events/cloudwatch.json
 sam validate --lint
 python -m pytest tests/ -v
 sam deploy --no-confirm-changeset          # CI does this on push to main

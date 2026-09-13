@@ -1,15 +1,20 @@
-import importlib
+"""The summarizer handler: one model call per generation, then the delivery
+chain in order, with the per-stage markers that make a retry resume rather
+than repeat (RC1-384, RC1-431). The stages themselves are stubbed here; each
+has its own test_delivery_*.py."""
 import json
-import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError
+
+from common import aws
+from tests.conftest import load_function_module
 
 INCIDENT_TABLE = "test-incident-table"
 API_KEY_SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:anthropic-key"
 API_KEY = "sk-ant-test-key"
 MODEL_ID = "claude-sonnet-4-6"
-SLACK_NOTIFIER_FUNCTION = "test-slack-notifier"
 
 INCIDENT = {
     "incident_id": "inc-123",
@@ -36,6 +41,7 @@ INCIDENT = {
     ],
     "created_at": "2024-01-15T10:00:00Z",
 }
+GENERATION = len(INCIDENT["source_alerts"])
 
 LLM_RESPONSE = {
     "summary": "Payments service is experiencing high error rates and latency spikes.",
@@ -43,15 +49,9 @@ LLM_RESPONSE = {
     "next_step": "Check database connection metrics and restart if needed.",
 }
 
-
-def _load_summarizer():
-    for mod in list(sys.modules):
-        if mod == "app" or mod.startswith("app."):
-            del sys.modules[mod]
-    sys.path.insert(0, "functions/summarizer")
-    import app
-    importlib.reload(app)
-    return app
+THREAD_TS = "1705312800.000001"
+TICKET = "INC-7"
+EVENT_ID = "555"
 
 
 def _mock_anthropic(response: dict = None):
@@ -62,29 +62,69 @@ def _mock_anthropic(response: dict = None):
     return mock
 
 
+def _stage(key: str, value: str) -> MagicMock:
+    """A delivery stage that, like the real ones, records its artifact on the incident."""
+    def deliver(incident, recovered):
+        incident[key] = value
+        return value
+    return MagicMock(side_effect=deliver)
+
+
+def _serve(mock_table, incident: dict = INCIDENT) -> None:
+    """get_item returns a copy, since the handler writes into what it reads."""
+    mock_table.get_item.return_value = {"Item": dict(incident)}
+
+
+def _serve_fresh(mock_table, incident: dict = INCIDENT) -> None:
+    """A fresh copy per get_item, for tests that invoke the handler repeatedly."""
+    mock_table.get_item.side_effect = lambda **_: {"Item": dict(incident)}
+
+
+def _summary_write(mock_table) -> dict:
+    writes = [
+        c[1] for c in mock_table.update_item.call_args_list
+        if c[1]["UpdateExpression"].startswith(("SET llm_summary", "SET recovery_summary"))
+    ]
+    assert len(writes) == 1, writes
+    return writes[0]
+
+
+def _marker_writes(mock_table) -> dict[str, int]:
+    return {
+        c[1]["UpdateExpression"].split()[1]: c[1]["ExpressionAttributeValues"][":g"]
+        for c in mock_table.update_item.call_args_list
+        if c[1]["UpdateExpression"].endswith("_delivered_count = :g")
+    }
+
+
 @pytest.fixture()
 def summarizer(monkeypatch):
     monkeypatch.setenv("INCIDENT_TABLE_NAME", INCIDENT_TABLE)
     monkeypatch.setenv("ANTHROPIC_API_KEY_SECRET_ARN", API_KEY_SECRET_ARN)
     monkeypatch.setenv("MODEL_ID", MODEL_ID)
-    monkeypatch.setenv("SLACK_NOTIFIER_FUNCTION_NAME", SLACK_NOTIFIER_FUNCTION)
 
+    aws.reset()
     mock_table = MagicMock()
-    mock_table.get_item.return_value = {"Item": INCIDENT}
+    _serve(mock_table)
     mock_table.update_item.return_value = {}
+    aws._tables[INCIDENT_TABLE] = mock_table
 
     mock_secrets = MagicMock()
     mock_secrets.get_secret_value.return_value = {"SecretString": API_KEY}
+    aws._secrets_client = mock_secrets
 
-    mock_lambda_client = MagicMock()
+    app = load_function_module("summarizer")
+    app._anthropic_client = None
+    app._STAGES = (
+        ("slack", _stage("slack_thread_id", THREAD_TS)),
+        ("jira", _stage("jira_ticket_id", TICKET)),
+        ("datadog", _stage("datadog_event_id", EVENT_ID)),
+    )
+    yield app, mock_table, mock_secrets
 
-    with patch("boto3.resource"), patch("boto3.client"):
-        app = _load_summarizer()
-        app._incident_table = mock_table
-        app._secrets_client = mock_secrets
-        app._lambda_client = mock_lambda_client
-        app._api_key_cache.clear()
-        yield app, mock_table, mock_secrets
+
+def _stages(app) -> dict[str, MagicMock]:
+    return dict(app._STAGES)
 
 
 # ── Handler tests ─────────────────────────────────────────────────────────────
@@ -102,22 +142,21 @@ class TestHandler:
         app, mock_table, _ = summarizer
         with patch("anthropic.Anthropic", _mock_anthropic()):
             app.handler({"incident_id": "inc-123"}, None)
-        mock_table.update_item.assert_called_once()
-        stored = json.loads(
-            mock_table.update_item.call_args[1]["ExpressionAttributeValues"][":s"]
-        )
+        stored = json.loads(_summary_write(mock_table)["ExpressionAttributeValues"][":s"])
         assert "summary" in stored
         assert "likely_cause" in stored
         assert "next_step" in stored
 
-    def test_returns_incident_id_and_summary(self, summarizer):
+    def test_returns_incident_id_summary_and_artifact_ids(self, summarizer):
         app, _, _ = summarizer
         with patch("anthropic.Anthropic", _mock_anthropic()):
             result = app.handler({"incident_id": "inc-123"}, None)
         assert result["incident_id"] == "inc-123"
-        assert "llm_summary" in result
-        parsed = json.loads(result["llm_summary"])
-        assert parsed == LLM_RESPONSE
+        assert json.loads(result["llm_summary"]) == LLM_RESPONSE
+        assert result["slack_thread_id"] == THREAD_TS
+        assert result["jira_ticket_id"] == TICKET
+        assert result["datadog_event_id"] == EVENT_ID
+        assert result["delivered"] == ["slack", "jira", "datadog"]
 
     def test_fallback_written_to_dynamodb_on_llm_error(self, summarizer):
         app, mock_table, _ = summarizer
@@ -126,24 +165,23 @@ class TestHandler:
         with patch("anthropic.Anthropic", mock_anthropic):
             result = app.handler({"incident_id": "inc-123"}, None)
         assert result is not None
-        mock_table.update_item.assert_called_once()
-        stored = json.loads(
-            mock_table.update_item.call_args[1]["ExpressionAttributeValues"][":s"]
-        )
+        stored = json.loads(_summary_write(mock_table)["ExpressionAttributeValues"][":s"])
         assert "summary" in stored
         assert "likely_cause" in stored
         assert "next_step" in stored
+        # A fallback summary is still delivered; the responder must hear.
+        assert result["delivered"] == ["slack", "jira", "datadog"]
 
     def test_returns_none_when_no_incident_id(self, summarizer):
         app, _, _ = summarizer
-        result = app.handler({}, None)
-        assert result is None
+        assert app.handler({}, None) is None
+        _stages(app)["slack"].assert_not_called()
 
     def test_returns_none_when_incident_not_found(self, summarizer):
         app, mock_table, _ = summarizer
         mock_table.get_item.return_value = {}
-        result = app.handler({"incident_id": "nonexistent"}, None)
-        assert result is None
+        assert app.handler({"incident_id": "nonexistent"}, None) is None
+        _stages(app)["slack"].assert_not_called()
 
 
 # ── API key caching tests ─────────────────────────────────────────────────────
@@ -156,7 +194,8 @@ class TestApiKey:
         mock_secrets.get_secret_value.assert_called_once_with(SecretId=API_KEY_SECRET_ARN)
 
     def test_api_key_cached_across_calls(self, summarizer):
-        app, _, mock_secrets = summarizer
+        app, mock_table, mock_secrets = summarizer
+        _serve_fresh(mock_table)
         with patch("anthropic.Anthropic", _mock_anthropic()):
             app.handler({"incident_id": "inc-123"}, None)
             app.handler({"incident_id": "inc-123"}, None)
@@ -200,15 +239,15 @@ RECOVERY_RESPONSE = {
 
 class TestRecovery:
     def _run(self, app, mock_table, response=RECOVERY_RESPONSE, incident=RESOLVED_INCIDENT):
-        mock_table.get_item.return_value = {"Item": incident}
+        _serve(mock_table, incident)
         with patch("anthropic.Anthropic", _mock_anthropic(response)) as mock_anthropic:
             result = app.handler({"incident_id": "inc-123", "recovered": True}, None)
         return result, mock_anthropic
 
     def test_writes_recovery_summary_not_llm_summary(self, summarizer):
-        app, mock_table, *_ = summarizer
+        app, mock_table, _ = summarizer
         self._run(app, mock_table)
-        kwargs = mock_table.update_item.call_args[1]
+        kwargs = _summary_write(mock_table)
         # The claim marker rides along in the same update (RC1-384); what this
         # test guards is that the *summary* lands in recovery_summary and
         # leaves llm_summary alone.
@@ -217,7 +256,7 @@ class TestRecovery:
         assert json.loads(kwargs["ExpressionAttributeValues"][":s"]) == RECOVERY_RESPONSE
 
     def test_recovery_prompt_describes_the_recovery(self, summarizer):
-        app, mock_table, *_ = summarizer
+        app, mock_table, _ = summarizer
         _, mock_anthropic = self._run(app, mock_table)
         prompt = mock_anthropic.return_value.messages.create.call_args[1]["messages"][0]["content"]
         assert "RECOVERED" in prompt
@@ -225,48 +264,41 @@ class TestRecovery:
         assert "2024-01-15T10:42:30Z" in prompt
         assert LLM_RESPONSE["summary"] in prompt
 
-    def test_recovery_hands_off_to_slack_with_flag(self, summarizer):
+    def test_recovery_delivers_every_stage_with_the_flag(self, summarizer):
         app, mock_table, _ = summarizer
         self._run(app, mock_table)
-        payload = json.loads(app._lambda_client.invoke.call_args[1]["Payload"])
-        assert payload == {"incident_id": "inc-123", "recovered": True}
+        for stage in _stages(app).values():
+            stage.assert_called_once_with(ANY, True)
 
     def test_recovery_fallback_mentions_duration(self, summarizer):
-        app, mock_table, *_ = summarizer
-        mock_table.get_item.return_value = {"Item": RESOLVED_INCIDENT}
+        app, mock_table, _ = summarizer
+        _serve(mock_table, RESOLVED_INCIDENT)
         failing = MagicMock()
         failing.return_value.messages.create.side_effect = RuntimeError("boom")
         with patch("anthropic.Anthropic", failing):
             app.handler({"incident_id": "inc-123", "recovered": True}, None)
-        written = json.loads(mock_table.update_item.call_args[1]["ExpressionAttributeValues"][":s"])
+        written = json.loads(_summary_write(mock_table)["ExpressionAttributeValues"][":s"])
         assert "recovered after 42m 30s" in written["summary"]
 
-    def test_open_incident_handoff_carries_no_flag(self, summarizer):
+    def test_open_incident_delivery_carries_no_flag(self, summarizer):
         app, mock_table, _ = summarizer
-        mock_table.get_item.return_value = {"Item": INCIDENT}
         with patch("anthropic.Anthropic", _mock_anthropic()):
             app.handler({"incident_id": "inc-123"}, None)
-        assert json.loads(app._lambda_client.invoke.call_args[1]["Payload"]) == {"incident_id": "inc-123"}
+        for stage in _stages(app).values():
+            stage.assert_called_once_with(ANY, False)
 
 
-# ── Delivery is claimed once per generation (RC1-384) ─────────────────────────
+# ── One summary per generation (RC1-384) ─────────────────────────────────────
 
-class TestDeliveryClaim:
-    """`dedup` invokes this function asynchronously, so Lambda retries a failed
-    invocation twice. The handler used to do its Slack invoke unconditionally,
-    which meant a retry of a run that had already delivered posted the same
-    summary into the thread again — and the function was timing out *after*
-    delivering, so every incident was a retry candidate.
-
-    The summary write now carries the generation it summarized and refuses to
-    go backwards. A repeat of the same generation stops before Slack; a real
-    re-summary, with another alert in the window, still gets through.
+class TestGenerations:
+    """Ingest invokes this function asynchronously, so Lambda retries a failed
+    invocation twice, and two alerts landing seconds apart run as concurrent
+    invocations for consecutive generations. The summary write carries the
+    generation it summarized and refuses to go backwards.
     """
 
     @staticmethod
     def _conditional_check_failed():
-        from botocore.exceptions import ClientError
-
         return ClientError(
             {"Error": {"Code": "ConditionalCheckFailedException", "Message": "no"}},
             "UpdateItem",
@@ -276,43 +308,91 @@ class TestDeliveryClaim:
         app, mock_table, _ = summarizer
         with patch("anthropic.Anthropic", _mock_anthropic()):
             app.handler({"incident_id": "inc-123"}, None)
-        kwargs = mock_table.update_item.call_args[1]
-        # INCIDENT carries two source_alerts.
-        assert kwargs["ExpressionAttributeValues"][":g"] == 2
+        kwargs = _summary_write(mock_table)
+        assert kwargs["ExpressionAttributeValues"][":g"] == GENERATION
         assert "summarized_alert_count" in kwargs["UpdateExpression"]
         assert "attribute_not_exists(summarized_alert_count)" in kwargs["ConditionExpression"]
         assert "summarized_alert_count < :g" in kwargs["ConditionExpression"]
 
-    def test_repeat_of_the_same_generation_does_not_notify(self, summarizer):
+    def test_retry_of_a_summarized_generation_skips_the_model_and_resumes_delivery(self, summarizer):
+        """The invocation died after Slack. The retry must not call the model
+        or post to Slack again, and must still do Jira and Datadog."""
         app, mock_table, _ = summarizer
-        mock_table.update_item.side_effect = self._conditional_check_failed()
+        _serve(mock_table, {**INCIDENT, "llm_summary": json.dumps(LLM_RESPONSE),
+                            "summarized_alert_count": GENERATION, "slack_delivered_count": GENERATION,
+                            "slack_thread_id": THREAD_TS})
+        mock_anthropic = _mock_anthropic()
+        with patch("anthropic.Anthropic", mock_anthropic):
+            result = app.handler({"incident_id": "inc-123"}, None)
+        mock_anthropic.return_value.messages.create.assert_not_called()
+        stages = _stages(app)
+        stages["slack"].assert_not_called()
+        stages["jira"].assert_called_once()
+        stages["datadog"].assert_called_once()
+        assert result["delivered"] == ["jira", "datadog"]
+        assert json.loads(result["llm_summary"]) == LLM_RESPONSE
+
+    def test_superseded_generation_stops_before_delivery(self, summarizer):
+        """A newer alert joined the window and its invocation already
+        summarized generation 3. This generation-2 invocation would only post
+        a stale summary."""
+        app, mock_table, _ = summarizer
+        _serve(mock_table, {**INCIDENT, "summarized_alert_count": GENERATION + 1})
+        mock_anthropic = _mock_anthropic()
+        with patch("anthropic.Anthropic", mock_anthropic):
+            assert app.handler({"incident_id": "inc-123"}, None) is None
+        mock_anthropic.return_value.messages.create.assert_not_called()
+        for stage in _stages(app).values():
+            stage.assert_not_called()
+
+    def test_fully_delivered_generation_posts_nothing(self, summarizer):
+        app, mock_table, _ = summarizer
+        _serve(mock_table, {**INCIDENT, "llm_summary": json.dumps(LLM_RESPONSE),
+                            "summarized_alert_count": GENERATION, "slack_delivered_count": GENERATION,
+                            "jira_delivered_count": GENERATION, "datadog_delivered_count": GENERATION,
+                            "slack_thread_id": THREAD_TS, "jira_ticket_id": TICKET, "datadog_event_id": EVENT_ID})
         with patch("anthropic.Anthropic", _mock_anthropic()):
             result = app.handler({"incident_id": "inc-123"}, None)
-        assert result is None
-        app._lambda_client.invoke.assert_not_called()
+        for stage in _stages(app).values():
+            stage.assert_not_called()
+        mock_table.update_item.assert_not_called()
+        assert result["delivered"] == []
+        assert result["jira_ticket_id"] == TICKET
 
-    def test_first_delivery_still_notifies(self, summarizer):
-        app, _, _ = summarizer
+    def test_concurrent_claim_re_reads_and_delivers_the_stored_summary(self, summarizer):
+        """Between this invocation's read and its write, another invocation
+        claimed the same generation. Deliver what it stored, not ours."""
+        app, mock_table, _ = summarizer
+        theirs = {"summary": "theirs", "likely_cause": "theirs", "next_step": "theirs"}
+        claimed = {**INCIDENT, "llm_summary": json.dumps(theirs), "summarized_alert_count": GENERATION}
+        mock_table.get_item.side_effect = [{"Item": dict(INCIDENT)}, {"Item": dict(claimed)}]
+
+        def update(**kwargs):
+            if kwargs["UpdateExpression"].startswith("SET llm_summary"):
+                raise self._conditional_check_failed()
+            return {}
+        mock_table.update_item.side_effect = update
+
         with patch("anthropic.Anthropic", _mock_anthropic()):
-            app.handler({"incident_id": "inc-123"}, None)
-        app._lambda_client.invoke.assert_called_once()
+            result = app.handler({"incident_id": "inc-123"}, None)
+        assert json.loads(result["llm_summary"]) == theirs
+        assert _stages(app)["slack"].call_args[0][0]["llm_summary"] == json.dumps(theirs)
 
     def test_recovery_claims_a_separate_marker(self, summarizer):
         """A recovery summary is a different field and must not be blocked by
         the open-incident claim, or a resolved incident never announces itself."""
         app, mock_table, _ = summarizer
-        mock_table.get_item.return_value = {"Item": RESOLVED_INCIDENT}
+        _serve(mock_table, {**RESOLVED_INCIDENT, "summarized_alert_count": GENERATION})
         with patch("anthropic.Anthropic", _mock_anthropic()):
             app.handler({"incident_id": "inc-123", "recovered": True}, None)
-        kwargs = mock_table.update_item.call_args[1]
+        kwargs = _summary_write(mock_table)
         assert "recovery_summarized_count" in kwargs["UpdateExpression"]
         assert "summarized_alert_count" not in kwargs["UpdateExpression"]
+        _stages(app)["slack"].assert_called_once()
 
     def test_a_real_dynamodb_error_is_not_swallowed(self, summarizer):
-        """Only the conditional check means 'already delivered'. Anything else
+        """Only the conditional check means 'already claimed'. Anything else
         is a broken table and must page rather than look like a duplicate."""
-        from botocore.exceptions import ClientError
-
         app, mock_table, _ = summarizer
         mock_table.update_item.side_effect = ClientError(
             {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "slow down"}},
@@ -321,6 +401,69 @@ class TestDeliveryClaim:
         with patch("anthropic.Anthropic", _mock_anthropic()):
             with pytest.raises(ClientError):
                 app.handler({"incident_id": "inc-123"}, None)
+        _stages(app)["slack"].assert_not_called()
+
+
+# ── The delivery chain (RC1-431) ──────────────────────────────────────────────
+
+class TestDeliveryChain:
+    def test_stages_run_in_order_slack_jira_datadog(self, summarizer):
+        """The Datadog event carries the Slack and Jira links, so it is last."""
+        app, _, _ = summarizer
+        order = []
+        for name, stage in app._STAGES:
+            stage.side_effect = lambda incident, recovered, name=name: order.append(name) or name
+        with patch("anthropic.Anthropic", _mock_anthropic()):
+            app.handler({"incident_id": "inc-123"}, None)
+        assert order == ["slack", "jira", "datadog"]
+
+    def test_each_stage_marks_its_generation(self, summarizer):
+        app, mock_table, _ = summarizer
+        with patch("anthropic.Anthropic", _mock_anthropic()):
+            app.handler({"incident_id": "inc-123"}, None)
+        assert _marker_writes(mock_table) == {
+            "slack_delivered_count": GENERATION,
+            "jira_delivered_count": GENERATION,
+            "datadog_delivered_count": GENERATION,
+        }
+
+    def test_later_stages_see_what_earlier_ones_wrote(self, summarizer):
+        app, _, _ = summarizer
+        with patch("anthropic.Anthropic", _mock_anthropic()):
+            app.handler({"incident_id": "inc-123"}, None)
+        seen_by_datadog = _stages(app)["datadog"].call_args[0][0]
+        assert seen_by_datadog["slack_thread_id"] == THREAD_TS
+        assert seen_by_datadog["jira_ticket_id"] == TICKET
+
+    def test_a_failing_stage_stops_the_chain_with_its_marker_unwritten(self, summarizer):
+        """Slack failed after three attempts. The exception reaches Lambda, so
+        it retries; Jira and Datadog wait for that retry rather than running
+        ahead of the Slack post the Jira ticket links to."""
+        app, mock_table, _ = summarizer
+        stages = _stages(app)
+        stages["slack"].side_effect = RuntimeError("slack is down")
+        with patch("anthropic.Anthropic", _mock_anthropic()):
+            with pytest.raises(RuntimeError):
+                app.handler({"incident_id": "inc-123"}, None)
+        stages["jira"].assert_not_called()
+        stages["datadog"].assert_not_called()
+        assert _marker_writes(mock_table) == {}
+        # The summary itself was claimed, so the retry skips the model call.
+        assert _summary_write(mock_table)["ExpressionAttributeValues"][":g"] == GENERATION
+
+    def test_a_newer_generation_keeps_its_marker(self, summarizer):
+        """The marker write is conditional: a generation-3 invocation that
+        already marked Slack must not be rewound to 2 by this one."""
+        app, mock_table, _ = summarizer
+
+        def update(**kwargs):
+            if kwargs["UpdateExpression"].startswith("SET slack_delivered_count"):
+                raise ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": "no"}}, "UpdateItem")
+            return {}
+        mock_table.update_item.side_effect = update
+        with patch("anthropic.Anthropic", _mock_anthropic()):
+            result = app.handler({"incident_id": "inc-123"}, None)
+        assert result["delivered"] == ["slack", "jira", "datadog"]
 
 
 # ── The Anthropic client is reused, not rebuilt (RC1-385) ─────────────────────
@@ -336,13 +479,15 @@ class TestClientReuse:
     """
 
     def test_client_is_built_once_across_invocations(self, summarizer):
-        app, _, _ = summarizer
+        app, mock_table, _ = summarizer
+        _serve_fresh(mock_table)
         mock_anthropic = _mock_anthropic()
         with patch("anthropic.Anthropic", mock_anthropic):
             app.handler({"incident_id": "inc-123"}, None)
             app.handler({"incident_id": "inc-123"}, None)
             app.handler({"incident_id": "inc-123"}, None)
         assert mock_anthropic.call_count == 1
+        assert mock_anthropic.return_value.messages.create.call_count == 3
 
     def test_client_is_cached_on_the_module(self, summarizer):
         app, _, _ = summarizer
@@ -353,10 +498,13 @@ class TestClientReuse:
 
     def test_still_sends_the_model_from_the_env_var_when_reused(self, summarizer):
         """Reuse must not freeze configuration that is read per call."""
-        app, _, _ = summarizer
+        app, mock_table, _ = summarizer
+        _serve_fresh(mock_table)
         mock_anthropic = _mock_anthropic()
         with patch("anthropic.Anthropic", mock_anthropic):
             app.handler({"incident_id": "inc-123"}, None)
             app.handler({"incident_id": "inc-123"}, None)
-        for call in mock_anthropic.return_value.messages.create.call_args_list:
+        calls = mock_anthropic.return_value.messages.create.call_args_list
+        assert len(calls) == 2
+        for call in calls:
             assert call[1]["model"] == MODEL_ID

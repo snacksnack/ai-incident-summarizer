@@ -1,8 +1,10 @@
 """The shipped summarizer, loaded as-is (RC1-267).
 
 `functions/summarizer/app.py` is a Lambda module, not a package, so it is
-loaded by path. Its module body creates boto3 clients, which only need a
-region to construct — no call is ever made, so no credential is needed.
+loaded by path. It imports its sibling `delivery` package and the shared
+layer, so both directories go on sys.path first, the way Lambda's /var/task
+and /opt/python are. No AWS client is built at import (RC1-431), so no region
+or credential is needed.
 
 The versions reported to the run store are read off the shipped artifacts
 rather than declared by hand: the model from `template.yaml`'s pin, the
@@ -16,13 +18,13 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import inspect
-import os
 import re
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-APP_PATH = REPO_ROOT / "functions" / "summarizer" / "app.py"
+FUNCTION_DIR = REPO_ROOT / "functions" / "summarizer"
+APP_PATH = FUNCTION_DIR / "app.py"
 # The Lambda imports `common` from the shared layer (RC1-374); in production the
 # layer is on sys.path, here it has to be put there before the module body runs.
 LAYER_PATH = REPO_ROOT / "layers" / "common" / "python"
@@ -38,9 +40,9 @@ _app = None
 def app():
     global _app
     if _app is None:
-        os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
-        if str(LAYER_PATH) not in sys.path:
-            sys.path.insert(0, str(LAYER_PATH))
+        for path in (LAYER_PATH, FUNCTION_DIR):
+            if str(path) not in sys.path:
+                sys.path.insert(0, str(path))
         spec = importlib.util.spec_from_file_location("incident_summarizer_app", APP_PATH)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

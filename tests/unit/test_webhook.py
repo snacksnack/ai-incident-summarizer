@@ -1,17 +1,19 @@
+"""Webhook authentication at the edge of the ingest function. What happens to
+an accepted envelope is stubbed (`app._accept`) and covered in test_ingest.py."""
 import hashlib
 import hmac
-import importlib
 import json
-import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from common import aws
+from tests.conftest import load_function_module
 
 GITHUB_SECRET = "github-test-secret"
 DATADOG_SECRET = "datadog-test-secret"
 GITHUB_SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:github-webhook"
 DATADOG_SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:datadog-webhook"
-NORMALIZER_FUNCTION_NAME = "normalizer-function"
 
 
 def _github_sig(body: str, secret: str = GITHUB_SECRET) -> str:
@@ -28,43 +30,29 @@ def _make_event(path: str, body: str, headers: dict) -> dict:
     }
 
 
-@pytest.fixture(autouse=True)
-def fresh_module():
-    """Reload the module each test so the secret cache is cleared."""
-    for mod in list(sys.modules):
-        if "webhook_receiver" in mod:
-            del sys.modules[mod]
-    yield
-
-
 @pytest.fixture()
 def mock_aws(monkeypatch):
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET_ARN", GITHUB_SECRET_ARN)
     monkeypatch.setenv("DATADOG_WEBHOOK_SECRET_ARN", DATADOG_SECRET_ARN)
-    monkeypatch.setenv("NORMALIZER_FUNCTION_NAME", NORMALIZER_FUNCTION_NAME)
 
+    aws.reset()
     mock_secrets = MagicMock()
     mock_secrets.get_secret_value.side_effect = lambda SecretId, **_: {
         GITHUB_SECRET_ARN: {"SecretString": GITHUB_SECRET},
         DATADOG_SECRET_ARN: {"SecretString": DATADOG_SECRET},
     }[SecretId]
+    aws._secrets_client = mock_secrets
 
-    mock_lambda = MagicMock()
-    mock_lambda.invoke.return_value = {}
+    with patch("boto3.client"):
+        app = load_function_module("ingest")
+    accept = MagicMock(return_value=app.webhook.response(202, {"status": "accepted"}))
+    app._accept = accept
+    yield app, accept, mock_secrets
 
-    with patch("boto3.client") as mock_boto3:
-        def client_factory(service, **kwargs):
-            if service == "secretsmanager":
-                return mock_secrets
-            if service == "lambda":
-                return mock_lambda
-            return MagicMock()
 
-        mock_boto3.side_effect = client_factory
-        sys.path.insert(0, "functions/webhook_receiver")
-        import app
-        importlib.reload(app)
-        yield app, mock_lambda, mock_secrets
+def _envelope(accept: MagicMock) -> dict:
+    accept.assert_called_once()
+    return accept.call_args[0][0]
 
 
 GITHUB_BODY = json.dumps({"action": "completed", "workflow_run": {"conclusion": "failure"}})
@@ -73,7 +61,7 @@ DATADOG_BODY = json.dumps({"id": "abc-123", "title": "Error rate above threshold
 
 class TestGithubWebhook:
     def test_valid_signature_returns_202(self, mock_aws):
-        app, mock_lambda, _ = mock_aws
+        app, accept, _ = mock_aws
         sig = _github_sig(GITHUB_BODY)
         event = _make_event("/webhook/github", GITHUB_BODY, {"x-hub-signature-256": sig})
         response = app.handler(event, None)
@@ -107,16 +95,12 @@ class TestGithubWebhook:
         response = app.handler(event, None)
         assert response["statusCode"] == 400
 
-    def test_forwards_envelope_to_normalizer(self, mock_aws):
-        app, mock_lambda, _ = mock_aws
+    def test_hands_envelope_to_ingest(self, mock_aws):
+        app, accept, _ = mock_aws
         sig = _github_sig(GITHUB_BODY)
         event = _make_event("/webhook/github", GITHUB_BODY, {"x-hub-signature-256": sig})
         app.handler(event, None)
-        mock_lambda.invoke.assert_called_once()
-        call_kwargs = mock_lambda.invoke.call_args[1]
-        assert call_kwargs["FunctionName"] == NORMALIZER_FUNCTION_NAME
-        assert call_kwargs["InvocationType"] == "Event"
-        payload = json.loads(call_kwargs["Payload"])
+        payload = _envelope(accept)
         assert payload["source"] == "github"
         assert payload["raw_payload"] == json.loads(GITHUB_BODY)
         assert "received_at" in payload
@@ -147,28 +131,28 @@ class TestDatadogWebhook:
         response = app.handler(event, None)
         assert response["statusCode"] == 400
 
-    def test_forwards_envelope_to_normalizer(self, mock_aws):
-        app, mock_lambda, _ = mock_aws
+    def test_hands_envelope_to_ingest(self, mock_aws):
+        app, accept, _ = mock_aws
         event = _make_event("/webhook/datadog", DATADOG_BODY, {"x-webhook-secret": DATADOG_SECRET})
         app.handler(event, None)
-        payload = json.loads(mock_lambda.invoke.call_args[1]["Payload"])
+        payload = _envelope(accept)
         assert payload["source"] == "datadog"
 
 
 class TestGitHubEventHeader:
     def test_github_event_name_is_forwarded(self, mock_aws):
-        app, mock_lambda, _ = mock_aws
+        app, accept, _ = mock_aws
         sig = _github_sig(GITHUB_BODY)
         event = _make_event("/webhook/github", GITHUB_BODY, {"x-hub-signature-256": sig, "x-github-event": "workflow_job"})
         app.handler(event, None)
-        payload = json.loads(mock_lambda.invoke.call_args[1]["Payload"])
+        payload = _envelope(accept)
         assert payload["github_event"] == "workflow_job"
 
     def test_datadog_envelope_has_no_github_event(self, mock_aws):
-        app, mock_lambda, _ = mock_aws
+        app, accept, _ = mock_aws
         event = _make_event("/webhook/datadog", DATADOG_BODY, {"x-webhook-secret": DATADOG_SECRET})
         app.handler(event, None)
-        payload = json.loads(mock_lambda.invoke.call_args[1]["Payload"])
+        payload = _envelope(accept)
         assert "github_event" not in payload
 
 
@@ -198,11 +182,11 @@ class TestStagePrefix:
         assert response["statusCode"] == 202
 
     def test_forwarded_envelope_path_has_no_stage(self, mock_aws):
-        app, mock_lambda, _ = mock_aws
+        app, accept, _ = mock_aws
         event = _make_event("/prod/webhook/datadog", DATADOG_BODY, {"x-webhook-secret": DATADOG_SECRET})
         event["routeKey"] = "POST /webhook/datadog"
         app.handler(event, None)
-        payload = json.loads(mock_lambda.invoke.call_args[1]["Payload"])
+        payload = _envelope(accept)
         assert payload["path"] == "/webhook/datadog"
         assert payload["source"] == "datadog"
 
@@ -225,7 +209,7 @@ class TestSecretShape:
 
     def test_json_wrapped_datadog_secret_matches_bare_header(self, mock_aws, monkeypatch):
         app, _, mock_secrets = mock_aws
-        app._secret_cache.clear()
+        aws._secrets.clear()
         mock_secrets.get_secret_value.side_effect = None
         mock_secrets.get_secret_value.return_value = {"SecretString": json.dumps({"dd-webhook-secret": DATADOG_SECRET})}
         event = _make_event("/webhook/datadog", DATADOG_BODY, {"x-webhook-secret": DATADOG_SECRET})
@@ -233,7 +217,7 @@ class TestSecretShape:
 
     def test_json_wrapped_github_secret_verifies_bare_signature(self, mock_aws):
         app, _, mock_secrets = mock_aws
-        app._secret_cache.clear()
+        aws._secrets.clear()
         mock_secrets.get_secret_value.side_effect = None
         mock_secrets.get_secret_value.return_value = {"SecretString": json.dumps({"gh-webhook-secret": GITHUB_SECRET})}
         event = _make_event("/webhook/github", GITHUB_BODY, {"x-hub-signature-256": _github_sig(GITHUB_BODY)})
@@ -246,8 +230,8 @@ class TestSecretShape:
 
     def test_multi_key_json_is_not_unwrapped(self, mock_aws):
         app, _, _ = mock_aws
-        assert app._secret_value('{"a": "1", "b": "2"}') == '{"a": "1", "b": "2"}'
+        assert app.webhook.secret_value('{"a": "1", "b": "2"}') == '{"a": "1", "b": "2"}'
 
     def test_malformed_json_is_used_verbatim(self, mock_aws):
         app, _, _ = mock_aws
-        assert app._secret_value("{not json") == "{not json"
+        assert app.webhook.secret_value("{not json") == "{not json"

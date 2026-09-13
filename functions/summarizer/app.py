@@ -3,35 +3,35 @@ import logging
 import os
 
 import anthropic
-import boto3
 from botocore.exceptions import ClientError
 
+from common import aws
 from common.duration import incident_duration
+from delivery import datadog_events, jira, slack
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-_secrets_client = boto3.client("secretsmanager")
-_lambda_client = boto3.client("lambda")
-_dynamodb = boto3.resource("dynamodb")
-_incident_table = None
 _anthropic_client = None
-_api_key_cache: dict[str, str] = {}
+
+# The delivery chain, in the order the Datadog event needs: it is last so it
+# carries both the Slack and Jira links. Each stage is idempotent about its
+# own artifact (thread, ticket, event row) and records the generation it
+# delivered, so a retried invocation resumes at the first stage that did not
+# finish instead of posting the earlier ones again.
+_STAGES = (
+    ("slack", slack.deliver),
+    ("jira", jira.deliver),
+    ("datadog", datadog_events.deliver),
+)
 
 
 def _get_incident_table():
-    global _incident_table
-    if _incident_table is None:
-        _incident_table = _dynamodb.Table(os.environ["INCIDENT_TABLE_NAME"])
-    return _incident_table
+    return aws.table("INCIDENT_TABLE_NAME")
 
 
 def _get_api_key() -> str:
-    arn = os.environ["ANTHROPIC_API_KEY_SECRET_ARN"]
-    if arn not in _api_key_cache:
-        response = _secrets_client.get_secret_value(SecretId=arn)
-        _api_key_cache[arn] = response["SecretString"]
-    return _api_key_cache[arn]
+    return aws.secret(os.environ["ANTHROPIC_API_KEY_SECRET_ARN"])
 
 
 def _build_prompt(incident: dict) -> str:
@@ -93,8 +93,8 @@ def _get_anthropic_client() -> anthropic.Anthropic:
 
     It used to be constructed inside `_call_llm`, so every invocation left
     another `httpx` connection pool behind and paid for a fresh TLS
-    handshake. Reusing it is the same pattern `_get_incident_table` and
-    `_api_key_cache` already follow.
+    handshake. Reusing it is the same pattern `common.aws` follows for tables
+    and secrets.
 
     History, so nobody re-derives it: this was first written as the fix for
     the python3.14 hang (RC1-385) on the reasoning that the summarizer was
@@ -152,6 +152,49 @@ def handler(event: dict, context) -> dict | None:
 
     recovered = bool(event.get("recovered"))
     field = "recovery_summary" if recovered else "llm_summary"
+    # `source_alerts` grows by one per alert joined to the incident (the
+    # recovery alert included), so its length identifies the generation
+    # being summarized and delivered.
+    generation = len(incident.get("source_alerts") or [])
+
+    llm_summary = _summarize(incident, field, generation, recovered)
+    if llm_summary is None:
+        return None
+
+    delivered = _deliver(incident, generation, recovered)
+    return {"incident_id": incident_id, field: llm_summary, **delivered}
+
+
+def _summarize(incident: dict, field: str, generation: int, recovered: bool) -> str | None:
+    """Write this generation's summary once; return it, or None when a newer
+    generation has superseded this invocation.
+
+    Ingest invokes this function with InvocationType="Event", so a failed
+    invocation is retried by Lambda twice, and two alerts landing seconds
+    apart run as two concurrent invocations for consecutive generations. The
+    summary write carries the generation it summarized and refuses to go
+    backwards (RC1-384):
+
+    - A retry of a generation already summarized skips the model call and
+      goes straight to delivery, where the per-stage markers decide what is
+      still owed.
+    - An invocation whose generation is behind the marker has been
+      superseded — the newer invocation delivers the newer summary — and
+      stops here.
+
+    Claimed *after* the model call rather than before: claiming first would
+    make a crash mid-summarize look delivered, and a dropped incident is
+    worse than a repeated model call on a rare retry.
+    """
+    incident_id = incident["incident_id"]
+    marker = "recovery_summarized_count" if recovered else "summarized_alert_count"
+    summarized = int(incident.get(marker, -1))
+    if summarized > generation:
+        logger.info("Incident %s already summarized generation %s, superseding %s", incident_id, summarized, generation)
+        return None
+    if summarized == generation:
+        logger.info("Incident %s generation %s already summarized, resuming delivery", incident_id, generation)
+        return incident.get(field)
 
     try:
         structured = _call_llm(incident, recovered=recovered)
@@ -161,26 +204,6 @@ def handler(event: dict, context) -> dict | None:
         logger.exception("LLM summarization failed for incident %s, using fallback", incident_id)
         llm_summary = json.dumps(_fallback_summary(incident, recovered=recovered))
 
-    # Write the summary and claim delivery in one conditional update (RC1-384).
-    #
-    # `dedup` invokes this function with InvocationType="Event", so a failed
-    # invocation is retried by Lambda twice. The Slack invoke below is the last
-    # thing this handler does, which means a retry of a run that already got
-    # that far posts the same summary into the thread a second time. That is
-    # not hypothetical: the function was timing out *after* delivering, so
-    # every incident was a retry candidate.
-    #
-    # `source_alerts` grows by one per alert joined to the incident, so its
-    # length identifies the generation being summarized. A retry of the same
-    # generation fails the condition and stops before Slack; a genuine
-    # re-summary — a new alert landed in the window — carries a higher count
-    # and proceeds, which is the threaded-reply behavior the chain is built on.
-    #
-    # Deliberately claimed *after* the model call rather than before: claiming
-    # first would make a crash mid-summarize look delivered, and a dropped
-    # incident is worse than a repeated model call on a rare retry.
-    marker = "recovery_summarized_count" if recovered else "summarized_alert_count"
-    generation = len(incident.get("source_alerts") or [])
     try:
         _get_incident_table().update_item(
             Key={"incident_id": incident_id},
@@ -191,28 +214,54 @@ def handler(event: dict, context) -> dict | None:
     except ClientError as e:
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise
-        logger.info(
-            "Incident %s already delivered %s for generation %s, not notifying again",
-            incident_id,
-            field,
-            generation,
-        )
-        return None
+        # Someone claimed this or a newer generation between our read and
+        # write. Re-read to learn which, and to deliver the stored summary
+        # rather than our unclaimed one.
+        fresh = _get_incident_table().get_item(Key={"incident_id": incident_id}).get("Item") or {}
+        incident.update(fresh)
+        if int(incident.get(marker, -1)) > generation:
+            logger.info("Incident %s generation %s superseded before its summary was written", incident_id, generation)
+            return None
+        logger.info("Incident %s generation %s summarized concurrently, resuming delivery", incident_id, generation)
+        return incident.get(field)
+
+    incident[field] = llm_summary
+    incident[marker] = generation
     logger.info("%s written to DynamoDB for incident %s", field, incident_id)
-
-    _lambda_client.invoke(
-        FunctionName=os.environ["SLACK_NOTIFIER_FUNCTION_NAME"],
-        InvocationType="Event",
-        Payload=json.dumps(_handoff(incident_id, recovered)),
-    )
-    logger.info("Slack notifier invoked for incident %s", incident_id)
-
-    return {"incident_id": incident_id, field: llm_summary}
+    return llm_summary
 
 
-def _handoff(incident_id: str, recovered: bool) -> dict:
-    # The flag rides the whole delivery chain; absent means the usual open-incident rendering.
-    payload = {"incident_id": incident_id}
-    if recovered:
-        payload["recovered"] = True
-    return payload
+def _deliver(incident: dict, generation: int, recovered: bool) -> dict:
+    """Run the delivery chain in order, skipping stages this generation has
+    already completed; return the artifact IDs."""
+    incident_id = incident["incident_id"]
+    delivered = {}
+    for stage, deliver in _STAGES:
+        marker = f"{stage}_delivered_count"
+        if int(incident.get(marker, -1)) >= generation:
+            logger.info("Incident %s generation %s already delivered to %s, skipping", incident_id, generation, stage)
+            continue
+        delivered[stage] = deliver(incident, recovered)
+        _mark_delivered(incident, marker, generation)
+    return {
+        "slack_thread_id": incident.get("slack_thread_id"),
+        "jira_ticket_id": incident.get("jira_ticket_id"),
+        "datadog_event_id": incident.get("datadog_event_id"),
+        "delivered": list(delivered),
+    }
+
+
+def _mark_delivered(incident: dict, marker: str, generation: int) -> None:
+    try:
+        _get_incident_table().update_item(
+            Key={"incident_id": incident["incident_id"]},
+            UpdateExpression=f"SET {marker} = :g",
+            ConditionExpression=f"attribute_not_exists({marker}) OR {marker} < :g",
+            ExpressionAttributeValues={":g": generation},
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        # A newer generation got there first; its marker stands.
+        return
+    incident[marker] = generation
