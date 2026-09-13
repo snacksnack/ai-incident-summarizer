@@ -1,53 +1,102 @@
-import json
+"""Fingerprint suppression, time-window grouping into incidents, and the
+recovery path that closes them.
+
+State is four DynamoDB tables, all reached through `common.aws`:
+the deduplication table (PK fingerprint, TTL), the correlation window table
+(PK service_key, TTL), the incident table and the service registry.
+"""
 import logging
 import os
 import time
 import uuid
 from datetime import datetime, timezone
 
-import boto3
 from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 
+from common import aws
 from common.fingerprint import generate_fingerprint
 
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-
-_dynamodb = boto3.resource("dynamodb")
-_lambda_client = boto3.client("lambda")
-_table = None
-_window_table = None
-_incident_table = None
-_service_registry_table = None
 
 
-def _get_table():
-    global _table
-    if _table is None:
-        _table = _dynamodb.Table(os.environ["DEDUP_TABLE_NAME"])
-    return _table
+def _dedup_table():
+    return aws.table("DEDUP_TABLE_NAME")
 
 
-def _get_window_table():
-    global _window_table
-    if _window_table is None:
-        _window_table = _dynamodb.Table(os.environ["CORRELATION_TABLE_NAME"])
-    return _window_table
+def _window_table():
+    return aws.table("CORRELATION_TABLE_NAME")
 
 
-def _get_incident_table():
-    global _incident_table
-    if _incident_table is None:
-        _incident_table = _dynamodb.Table(os.environ["INCIDENT_TABLE_NAME"])
-    return _incident_table
+def _incident_table():
+    return aws.table("INCIDENT_TABLE_NAME")
 
 
-def _get_service_registry_table():
-    global _service_registry_table
-    if _service_registry_table is None:
-        _service_registry_table = _dynamodb.Table(os.environ["SERVICE_REGISTRY_TABLE_NAME"])
-    return _service_registry_table
+def _service_registry_table():
+    return aws.table("SERVICE_REGISTRY_TABLE_NAME")
+
+
+def process(alert: dict) -> dict | None:
+    """Suppress, group or close; return what happened, or None when nothing did.
+
+    A duplicate inside the window returns None. An open alert returns the
+    incident it opened or joined (`is_new`, `alert_count`). A resolved alert
+    returns the incident it closed with `resolved: True`, or None when there
+    was nothing to close. The caller decides what to summarize from that.
+    """
+    fingerprint = generate_fingerprint(
+        source=alert["source"],
+        alert_name=alert["alert_name"],
+        affected_service=alert["affected_service"],
+    )
+
+    if alert.get("status") == "resolved":
+        return _handle_recovery(alert, fingerprint)
+
+    window_seconds = int(os.environ.get("CORRELATION_WINDOW_MINUTES", "5")) * 60
+    now = int(time.time())
+    ttl = now + window_seconds
+
+    try:
+        _dedup_table().put_item(
+            Item={
+                "fingerprint": fingerprint,
+                "first_seen_at": datetime.now(timezone.utc).isoformat(),
+                "source": alert["source"],
+                "alert_name": alert["alert_name"],
+                "ttl": ttl,
+            },
+            # An expired row that DynamoDB's TTL sweep has not yet removed (it
+            # promises deletion within ~48 h, not at expiry) must not count as a
+            # duplicate, or the 5-minute window silently becomes a 2-day one
+            # (RC1-372). Same rule the correlation window already applies.
+            ConditionExpression=(
+                Attr("fingerprint").not_exists() | Attr("ttl").lte(now)
+            ),
+        )
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            logger.warning(
+                "Suppressing duplicate alert: fingerprint=%s source=%s alert_name=%s affected_service=%s",
+                fingerprint,
+                alert["source"],
+                alert["alert_name"],
+                alert["affected_service"],
+            )
+            return None
+        raise
+
+    logger.info(
+        "New alert accepted: fingerprint=%s source=%s alert_name=%s",
+        fingerprint,
+        alert["source"],
+        alert["alert_name"],
+    )
+
+    grouping = _group_into_window(alert, window_seconds)
+    _persist_incident(alert, grouping)
+
+    return {"incident_id": grouping["incident_id"], "is_new": grouping["is_new"], "alert_count": grouping["alert_count"], "alert": alert}
 
 
 def _register_service(affected_service: str, now_iso: str) -> None:
@@ -62,7 +111,7 @@ def _register_service(affected_service: str, now_iso: str) -> None:
     outcome than a service missing from the filter list for one incident.
     """
     try:
-        _get_service_registry_table().update_item(
+        _service_registry_table().update_item(
             Key={"affected_service": affected_service},
             UpdateExpression=(
                 "SET last_seen_at = :ts, "
@@ -80,29 +129,29 @@ def _register_service(affected_service: str, now_iso: str) -> None:
         )
 
 
-def _alert_summary(event: dict) -> dict:
+def _alert_summary(alert: dict) -> dict:
     summary = {
-        "alert_id": event["alert_id"],
-        "source": event["source"],
-        "alert_name": event["alert_name"],
-        "severity": event["severity"],
-        "status": event["status"],
-        "received_at": event["received_at"],
+        "alert_id": alert["alert_id"],
+        "source": alert["source"],
+        "alert_name": alert["alert_name"],
+        "severity": alert["severity"],
+        "status": alert["status"],
+        "received_at": alert["received_at"],
     }
-    if event.get("monitor_id"):
-        summary["monitor_id"] = event["monitor_id"]
+    if alert.get("monitor_id"):
+        summary["monitor_id"] = alert["monitor_id"]
     return summary
 
 
-def _group_into_window(event: dict, window_seconds: int) -> dict:
-    service_key = event["affected_service"]
+def _group_into_window(alert: dict, window_seconds: int) -> dict:
+    service_key = alert["affected_service"]
     now = int(time.time())
     ttl = now + window_seconds
     incident_id = str(uuid.uuid4())
-    summary = _alert_summary(event)
+    summary = _alert_summary(alert)
 
     try:
-        _get_window_table().put_item(
+        _window_table().put_item(
             Item={
                 "service_key": service_key,
                 "incident_id": incident_id,
@@ -129,7 +178,7 @@ def _group_into_window(event: dict, window_seconds: int) -> dict:
             raise
 
     # Window is still open — append to the existing incident
-    response = _get_window_table().update_item(
+    response = _window_table().update_item(
         Key={"service_key": service_key},
         UpdateExpression=(
             "SET alert_summaries = list_append(alert_summaries, :s), "
@@ -157,18 +206,18 @@ def _group_into_window(event: dict, window_seconds: int) -> dict:
     }
 
 
-def _persist_incident(event: dict, grouping: dict) -> None:
+def _persist_incident(alert: dict, grouping: dict) -> None:
     incident_id = grouping["incident_id"]
-    summary = _alert_summary(event)
+    summary = _alert_summary(alert)
     now_iso = datetime.now(timezone.utc).isoformat()
 
     if grouping["is_new"]:
         try:
-            _get_incident_table().put_item(
+            _incident_table().put_item(
                 Item={
                     "incident_id": incident_id,
-                    "affected_service": event["affected_service"],
-                    "severity": event["severity"],
+                    "affected_service": alert["affected_service"],
+                    "severity": alert["severity"],
                     "status": "open",
                     "source_alerts": [summary],
                     "created_at": now_iso,
@@ -176,14 +225,14 @@ def _persist_incident(event: dict, grouping: dict) -> None:
                 ConditionExpression="attribute_not_exists(incident_id)",
             )
             logger.info("Persisted new incident: incident_id=%s", incident_id)
-            _register_service(event["affected_service"], now_iso)
+            _register_service(alert["affected_service"], now_iso)
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 logger.info("Incident %s already exists, skipping duplicate write", incident_id)
             else:
                 raise
     else:
-        _get_incident_table().update_item(
+        _incident_table().update_item(
             Key={"incident_id": incident_id},
             UpdateExpression=(
                 "SET source_alerts = list_append(source_alerts, :s), "
@@ -197,32 +246,32 @@ def _persist_incident(event: dict, grouping: dict) -> None:
         logger.info("Updated incident: incident_id=%s alert_count=%s", incident_id, grouping["alert_count"])
 
 
-def _find_open_incident(event: dict) -> dict | None:
+def _find_open_incident(alert: dict) -> dict | None:
     """The newest open incident for this service carrying an alert with the same
     source and name — the one a recovery of that alert closes."""
-    response = _get_incident_table().query(
+    response = _incident_table().query(
         IndexName="service-created-index",
-        KeyConditionExpression=Key("affected_service").eq(event["affected_service"]),
+        KeyConditionExpression=Key("affected_service").eq(alert["affected_service"]),
         ScanIndexForward=False,
         Limit=10,
     )
     for incident in response.get("Items", []):
         if incident.get("status") != "open":
             continue
-        for alert in incident.get("source_alerts", []):
-            if alert.get("source") == event["source"] and alert.get("alert_name") == event["alert_name"]:
+        for existing in incident.get("source_alerts", []):
+            if existing.get("source") == alert["source"] and existing.get("alert_name") == alert["alert_name"]:
                 return incident
     return None
 
 
-def _close_incident(event: dict, incident: dict, fingerprint: str) -> bool:
+def _close_incident(alert: dict, incident: dict, fingerprint: str) -> bool:
     """Append the recovery, mark the incident resolved, and retire the window
     and fingerprint rows so the next alert opens a fresh incident. False when a
     concurrent recovery already closed it."""
     incident_id = incident["incident_id"]
     now_iso = datetime.now(timezone.utc).isoformat()
     try:
-        _get_incident_table().update_item(
+        _incident_table().update_item(
             Key={"incident_id": incident_id},
             UpdateExpression=(
                 "SET source_alerts = list_append(source_alerts, :s), "
@@ -231,7 +280,7 @@ def _close_incident(event: dict, incident: dict, fingerprint: str) -> bool:
             ConditionExpression=Attr("status").eq("open"),
             ExpressionAttributeNames={"#st": "status"},
             ExpressionAttributeValues={
-                ":s": [_alert_summary(event)],
+                ":s": [_alert_summary(alert)],
                 ":resolved": "resolved",
                 ":ts": now_iso,
             },
@@ -242,106 +291,39 @@ def _close_incident(event: dict, incident: dict, fingerprint: str) -> bool:
         raise
 
     try:
-        _get_window_table().delete_item(
-            Key={"service_key": event["affected_service"]},
+        _window_table().delete_item(
+            Key={"service_key": alert["affected_service"]},
             ConditionExpression=Attr("incident_id").eq(incident_id),
         )
     except ClientError as e:
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise  # the window already belongs to a newer incident, or is gone
-    _get_table().delete_item(Key={"fingerprint": fingerprint})
+    _dedup_table().delete_item(Key={"fingerprint": fingerprint})
     return True
 
 
-def _handle_recovery(event: dict, fingerprint: str) -> dict | None:
+def _handle_recovery(alert: dict, fingerprint: str) -> dict | None:
     """A resolved alert is not an incident. It closes the open incident it
     belongs to, or it is dropped (RC1-374)."""
-    incident = _find_open_incident(event)
+    incident = _find_open_incident(alert)
     if incident is None:
         logger.info(
             "Recovery with no open incident to close, dropping: source=%s alert_name=%s affected_service=%s",
-            event["source"], event["alert_name"], event["affected_service"],
+            alert["source"], alert["alert_name"], alert["affected_service"],
         )
         return None
     incident_id = incident["incident_id"]
-    if not _close_incident(event, incident, fingerprint):
+    if not _close_incident(alert, incident, fingerprint):
         logger.info("Incident %s already resolved, dropping duplicate recovery", incident_id)
         return None
     logger.info(
         "Incident resolved: incident_id=%s service=%s by %s alert %s",
-        incident_id, event["affected_service"], event["source"], event["alert_name"],
-    )
-    _lambda_client.invoke(
-        FunctionName=os.environ["SUMMARIZER_FUNCTION_NAME"],
-        InvocationType="Event",
-        Payload=json.dumps({"incident_id": incident_id, "recovered": True}),
+        incident_id, alert["affected_service"], alert["source"], alert["alert_name"],
     )
     return {
         "incident_id": incident_id,
         "is_new": False,
         "resolved": True,
         "alert_count": len(incident.get("source_alerts", [])) + 1,
-        "alert": event,
+        "alert": alert,
     }
-
-
-def handler(event: dict, context) -> dict | None:
-    fingerprint = generate_fingerprint(
-        source=event["source"],
-        alert_name=event["alert_name"],
-        affected_service=event["affected_service"],
-    )
-
-    if event.get("status") == "resolved":
-        return _handle_recovery(event, fingerprint)
-
-    window_seconds = int(os.environ.get("CORRELATION_WINDOW_MINUTES", "5")) * 60
-    now = int(time.time())
-    ttl = now + window_seconds
-
-    try:
-        _get_table().put_item(
-            Item={
-                "fingerprint": fingerprint,
-                "first_seen_at": datetime.now(timezone.utc).isoformat(),
-                "source": event["source"],
-                "alert_name": event["alert_name"],
-                "ttl": ttl,
-            },
-            # An expired row that DynamoDB's TTL sweep has not yet removed (it
-            # promises deletion within ~48 h, not at expiry) must not count as a
-            # duplicate, or the 5-minute window silently becomes a 2-day one
-            # (RC1-372). Same rule the correlation window already applies.
-            ConditionExpression=(
-                Attr("fingerprint").not_exists() | Attr("ttl").lte(now)
-            ),
-        )
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            logger.warning(
-                "Suppressing duplicate alert: fingerprint=%s source=%s alert_name=%s affected_service=%s",
-                fingerprint,
-                event["source"],
-                event["alert_name"],
-                event["affected_service"],
-            )
-            return None
-        raise
-
-    logger.info(
-        "New alert accepted: fingerprint=%s source=%s alert_name=%s",
-        fingerprint,
-        event["source"],
-        event["alert_name"],
-    )
-
-    grouping = _group_into_window(event, window_seconds)
-    _persist_incident(event, grouping)
-
-    _lambda_client.invoke(
-        FunctionName=os.environ["SUMMARIZER_FUNCTION_NAME"],
-        InvocationType="Event",
-        Payload=json.dumps({"incident_id": grouping["incident_id"]}),
-    )
-
-    return {"incident_id": grouping["incident_id"], "is_new": grouping["is_new"], "alert_count": grouping["alert_count"], "alert": event}

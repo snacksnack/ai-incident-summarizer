@@ -1,19 +1,18 @@
+"""Datadog Events API v1: the summary that came out of Datadog's alerts goes
+back in as an event, so the timeline shows it beside the raw monitors. Last in
+the chain so the event carries the Slack and Jira links. Reuses the Lambda
+extension's API key secret: Datadog API keys carry no scopes, so there is no
+narrower key to mint."""
 import json
 import logging
 import os
 
-import boto3
 import requests
 
+from common import aws
 from common.duration import incident_duration
 
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-
-_secrets_client = boto3.client("secretsmanager")
-_dynamodb = boto3.resource("dynamodb")
-_incident_table = None
-_api_key_cache: dict[str, str] = {}
 
 # Datadog's v1 events endpoint caps `text` at 4000 characters.
 _TEXT_LIMIT = 4000
@@ -33,20 +32,22 @@ _PRIORITY = {
 }
 
 
-def _get_incident_table():
-    global _incident_table
-    if _incident_table is None:
-        _incident_table = _dynamodb.Table(os.environ["INCIDENT_TABLE_NAME"])
-    return _incident_table
+def deliver(incident: dict, recovered: bool = False) -> str:
+    """Post the incident's current state to the timeline; return the event ID."""
+    incident_id = incident["incident_id"]
+    event_id = _post_event(_build_event(incident, recovered=recovered))
+    aws.table("INCIDENT_TABLE_NAME").update_item(
+        Key={"incident_id": incident_id},
+        UpdateExpression="SET datadog_event_id = :e",
+        ExpressionAttributeValues={":e": event_id},
+    )
+    incident["datadog_event_id"] = event_id
+    logger.info("Datadog event %s posted for incident %s", event_id, incident_id)
+    return event_id
 
 
 def _get_api_key() -> str:
-    # The same key the Datadog Lambda extension already reads for traces and logs —
-    # Datadog API keys carry no scopes, so there is no narrower key to mint.
-    arn = os.environ["DD_API_KEY_SECRET_ARN"]
-    if arn not in _api_key_cache:
-        _api_key_cache[arn] = _secrets_client.get_secret_value(SecretId=arn)["SecretString"]
-    return _api_key_cache[arn]
+    return aws.secret(os.environ["DD_API_KEY_SECRET_ARN"])
 
 
 def _events_url() -> str:
@@ -173,26 +174,3 @@ def _post_event(event: dict) -> str:
     )
     response.raise_for_status()
     return str(response.json()["event"]["id"])
-
-
-def handler(event: dict, context) -> dict | None:
-    incident_id = event.get("incident_id")
-    if not incident_id:
-        logger.error("No incident_id in event")
-        return None
-
-    table = _get_incident_table()
-    response = table.get_item(Key={"incident_id": incident_id})
-    incident = response.get("Item")
-    if not incident:
-        logger.warning("Incident %s not found", incident_id)
-        return None
-
-    event_id = _post_event(_build_event(incident, recovered=bool(event.get("recovered"))))
-    table.update_item(
-        Key={"incident_id": incident_id},
-        UpdateExpression="SET datadog_event_id = :e",
-        ExpressionAttributeValues={":e": event_id},
-    )
-    logger.info("Datadog event %s posted for incident %s", event_id, incident_id)
-    return {"incident_id": incident_id, "datadog_event_id": event_id}

@@ -1,15 +1,12 @@
-import importlib
-import json
-import os
-import sys
 import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 from botocore.exceptions import ClientError
 
-# conftest.py adds layers/common/python to sys.path
+from common import aws
 from common.fingerprint import generate_fingerprint
+from tests.conftest import load_function_module
 
 ALERT = {
     "alert_id": "test-id-123",
@@ -61,16 +58,6 @@ class TestGenerateFingerprint:
 
 # ── Dedup handler tests ───────────────────────────────────────────────────────
 
-def _load_dedup():
-    for mod in list(sys.modules):
-        if mod == "app" or mod.startswith("app."):
-            del sys.modules[mod]
-    sys.path.insert(0, "functions/dedup")
-    import app
-    importlib.reload(app)
-    return app
-
-
 def _conditional_check_failed_error():
     error_response = {"Error": {"Code": "ConditionalCheckFailedException", "Message": "The conditional request failed"}}
     return ClientError(error_response, "PutItem")
@@ -84,7 +71,6 @@ def _other_dynamo_error():
 CORRELATION_TABLE = "test-correlation-table"
 INCIDENT_TABLE = "test-incident-table"
 SERVICE_REGISTRY_TABLE = "test-service-registry-table"
-SUMMARIZER_FUNCTION = "test-summarizer"
 
 
 @pytest.fixture()
@@ -93,22 +79,26 @@ def dedup(monkeypatch):
     monkeypatch.setenv("CORRELATION_TABLE_NAME", CORRELATION_TABLE)
     monkeypatch.setenv("INCIDENT_TABLE_NAME", INCIDENT_TABLE)
     monkeypatch.setenv("SERVICE_REGISTRY_TABLE_NAME", SERVICE_REGISTRY_TABLE)
-    monkeypatch.setenv("SUMMARIZER_FUNCTION_NAME", SUMMARIZER_FUNCTION)
     monkeypatch.setenv("CORRELATION_WINDOW_MINUTES", WINDOW_MINUTES)
+    aws.reset()
     mock_dedup_table = MagicMock()
     mock_window_table = MagicMock()
     mock_incident_table = MagicMock()
-    mock_lambda_client = MagicMock()
-    with patch("boto3.resource"), patch("boto3.client"):
-        app = _load_dedup()
-        app._table = mock_dedup_table
-        app._window_table = mock_window_table
-        app._incident_table = mock_incident_table
-        # Reached via app._service_registry_table rather than the fixture tuple,
-        # to keep the existing unpackings in this file unchanged.
-        app._service_registry_table = MagicMock()
-        app._lambda_client = mock_lambda_client
-        yield app, mock_dedup_table, mock_window_table, mock_incident_table, mock_lambda_client
+    mock_registry_table = MagicMock()
+    aws._tables.update({
+        DEDUP_TABLE: mock_dedup_table,
+        CORRELATION_TABLE: mock_window_table,
+        INCIDENT_TABLE: mock_incident_table,
+        SERVICE_REGISTRY_TABLE: mock_registry_table,
+    })
+    app = load_function_module("ingest", "dedup")
+    # Reached via registry_table() rather than the fixture tuple, to keep the
+    # existing unpackings in this file unchanged.
+    yield app, mock_dedup_table, mock_window_table, mock_incident_table, mock_registry_table
+
+
+def registry_table(app) -> MagicMock:
+    return aws._tables[SERVICE_REGISTRY_TABLE]
 
 
 class TestDedupHandler:
@@ -131,7 +121,7 @@ class TestDedupHandler:
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         mock_dedup_table.put_item.return_value = {}
         self._setup_new_incident(mock_window_table, mock_incident_table)
-        result = app.handler(ALERT, None)
+        result = app.process(ALERT)
         assert result is not None
         assert result["alert"] == ALERT
         assert result["is_new"] is True
@@ -142,7 +132,7 @@ class TestDedupHandler:
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         mock_dedup_table.put_item.return_value = {}
         self._setup_new_incident(mock_window_table, mock_incident_table)
-        app.handler(ALERT, None)
+        app.process(ALERT)
         mock_dedup_table.put_item.assert_called_once()
         call_kwargs = mock_dedup_table.put_item.call_args[1]
         assert call_kwargs["Item"]["fingerprint"] == generate_fingerprint(
@@ -153,7 +143,7 @@ class TestDedupHandler:
     def test_duplicate_returns_none(self, dedup):
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         mock_dedup_table.put_item.side_effect = _conditional_check_failed_error()
-        result = app.handler(ALERT, None)
+        result = app.process(ALERT)
         assert result is None
 
     def test_duplicate_logs_warning(self, dedup, caplog):
@@ -161,7 +151,7 @@ class TestDedupHandler:
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         mock_dedup_table.put_item.side_effect = _conditional_check_failed_error()
         with caplog.at_level(logging.WARNING):
-            app.handler(ALERT, None)
+            app.process(ALERT)
         assert "Suppressing duplicate alert" in caplog.text
         assert ALERT["source"] in caplog.text
         assert ALERT["alert_name"] in caplog.text
@@ -170,7 +160,7 @@ class TestDedupHandler:
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         mock_dedup_table.put_item.side_effect = _other_dynamo_error()
         with pytest.raises(ClientError):
-            app.handler(ALERT, None)
+            app.process(ALERT)
 
     def test_condition_accepts_missing_or_expired_fingerprint(self, dedup):
         # RC1-372: DynamoDB's TTL sweep is lazy (up to ~48 h), so the condition
@@ -180,7 +170,7 @@ class TestDedupHandler:
         mock_dedup_table.put_item.return_value = {}
         self._setup_new_incident(mock_window_table, mock_incident_table)
         with patch("time.time", return_value=1_700_000_000):
-            app.handler(ALERT, None)
+            app.process(ALERT)
         condition = mock_dedup_table.put_item.call_args[1]["ConditionExpression"]
         built = ConditionExpressionBuilder().build_expression(condition)
         names = {v: k for k, v in built.attribute_name_placeholders.items()}
@@ -194,7 +184,7 @@ class TestDedupHandler:
         mock_dedup_table.put_item.return_value = {}
         self._setup_new_incident(mock_window_table, mock_incident_table)
         before = int(time.time()) + int(WINDOW_MINUTES) * 60
-        app.handler(ALERT, None)
+        app.process(ALERT)
         after = int(time.time()) + int(WINDOW_MINUTES) * 60
         written_ttl = mock_dedup_table.put_item.call_args[1]["Item"]["ttl"]
         assert before <= written_ttl <= after
@@ -208,7 +198,7 @@ class TestWindowGrouping:
         mock_dedup_table.put_item.return_value = {}
         mock_window_table.put_item.return_value = {}
         mock_incident_table.put_item.return_value = {}
-        result = app.handler(ALERT, None)
+        result = app.process(ALERT)
         assert result["is_new"] is True
         assert result["alert_count"] == 1
         assert "incident_id" in result
@@ -225,7 +215,7 @@ class TestWindowGrouping:
             }
         }
         mock_incident_table.update_item.return_value = {}
-        result = app.handler(ALERT, None)
+        result = app.process(ALERT)
         assert result["is_new"] is False
         assert result["incident_id"] == "existing-inc-456"
         assert result["alert_count"] == 2
@@ -236,9 +226,9 @@ class TestWindowGrouping:
         mock_window_table.put_item.return_value = {}
         mock_incident_table.put_item.return_value = {}
 
-        result1 = app.handler(ALERT, None)
+        result1 = app.process(ALERT)
         other_alert = {**ALERT, "affected_service": "checkout-service"}
-        result2 = app.handler(other_alert, None)
+        result2 = app.process(other_alert)
 
         assert result1["incident_id"] != result2["incident_id"]
 
@@ -247,7 +237,7 @@ class TestWindowGrouping:
         mock_dedup_table.put_item.return_value = {}
         mock_window_table.put_item.return_value = {}
         mock_incident_table.put_item.return_value = {}
-        app.handler(ALERT, None)
+        app.process(ALERT)
         item = mock_window_table.put_item.call_args[1]["Item"]
         assert "alert_summaries" in item
         summary = item["alert_summaries"][0]
@@ -260,7 +250,7 @@ class TestWindowGrouping:
         mock_dedup_table.put_item.return_value = {}
         mock_window_table.put_item.side_effect = _other_dynamo_error()
         with pytest.raises(ClientError):
-            app.handler(ALERT, None)
+            app.process(ALERT)
 
 
 class TestAlertSummary:
@@ -284,7 +274,7 @@ class TestIncidentPersistence:
         mock_dedup_table.put_item.return_value = {}
         mock_window_table.put_item.return_value = {}
         mock_incident_table.put_item.return_value = {}
-        app.handler(ALERT, None)
+        app.process(ALERT)
         mock_incident_table.put_item.assert_called_once()
         item = mock_incident_table.put_item.call_args[1]["Item"]
         assert item["status"] == "open"
@@ -298,7 +288,7 @@ class TestIncidentPersistence:
         mock_dedup_table.put_item.return_value = {}
         mock_window_table.put_item.return_value = {}
         mock_incident_table.put_item.side_effect = _conditional_check_failed_error()
-        result = app.handler(ALERT, None)
+        result = app.process(ALERT)
         assert result is not None
 
     def test_existing_incident_calls_update_item(self, dedup):
@@ -309,7 +299,7 @@ class TestIncidentPersistence:
             "Attributes": {"incident_id": "inc-123", "alert_count": 2, "service_key": ALERT["affected_service"]}
         }
         mock_incident_table.update_item.return_value = {}
-        app.handler(ALERT, None)
+        app.process(ALERT)
         mock_incident_table.update_item.assert_called_once()
         call_kwargs = mock_incident_table.update_item.call_args[1]
         assert call_kwargs["Key"] == {"incident_id": "inc-123"}
@@ -320,7 +310,7 @@ class TestIncidentPersistence:
         mock_window_table.put_item.return_value = {}
         mock_incident_table.put_item.side_effect = _other_dynamo_error()
         with pytest.raises(ClientError):
-            app.handler(ALERT, None)
+            app.process(ALERT)
 
 
 # ── Service registry tests ────────────────────────────────────────────────────
@@ -334,8 +324,8 @@ class TestServiceRegistry:
     def test_new_incident_registers_service(self, dedup):
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         self._setup_new_incident(mock_dedup_table, mock_window_table, mock_incident_table)
-        app.handler(ALERT, None)
-        registry = app._service_registry_table
+        app.process(ALERT)
+        registry = registry_table(app)
         registry.update_item.assert_called_once()
         call_kwargs = registry.update_item.call_args[1]
         assert call_kwargs["Key"] == {"affected_service": ALERT["affected_service"]}
@@ -343,8 +333,8 @@ class TestServiceRegistry:
     def test_registry_write_sets_last_seen_and_preserves_first_seen(self, dedup):
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         self._setup_new_incident(mock_dedup_table, mock_window_table, mock_incident_table)
-        app.handler(ALERT, None)
-        call_kwargs = app._service_registry_table.update_item.call_args[1]
+        app.process(ALERT)
+        call_kwargs = registry_table(app).update_item.call_args[1]
         expression = call_kwargs["UpdateExpression"]
         assert "last_seen_at = :ts" in expression
         assert "first_seen_at = if_not_exists(first_seen_at, :ts)" in expression
@@ -358,34 +348,33 @@ class TestServiceRegistry:
             "Attributes": {"incident_id": "inc-123", "alert_count": 2, "service_key": ALERT["affected_service"]}
         }
         mock_incident_table.update_item.return_value = {}
-        app.handler(ALERT, None)
-        app._service_registry_table.update_item.assert_not_called()
+        app.process(ALERT)
+        registry_table(app).update_item.assert_not_called()
 
     def test_duplicate_incident_write_does_not_register(self, dedup):
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         mock_dedup_table.put_item.return_value = {}
         mock_window_table.put_item.return_value = {}
         mock_incident_table.put_item.side_effect = _conditional_check_failed_error()
-        app.handler(ALERT, None)
-        app._service_registry_table.update_item.assert_not_called()
+        app.process(ALERT)
+        registry_table(app).update_item.assert_not_called()
 
     def test_registry_failure_does_not_break_incident_flow(self, dedup):
-        app, mock_dedup_table, mock_window_table, mock_incident_table, mock_lambda_client = dedup
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         self._setup_new_incident(mock_dedup_table, mock_window_table, mock_incident_table)
-        app._service_registry_table.update_item.side_effect = _other_dynamo_error()
-        result = app.handler(ALERT, None)
+        registry_table(app).update_item.side_effect = _other_dynamo_error()
+        result = app.process(ALERT)
         assert result is not None
         assert result["is_new"] is True
         mock_incident_table.put_item.assert_called_once()
-        mock_lambda_client.invoke.assert_called_once()
 
     def test_registry_failure_logs_warning(self, dedup, caplog):
         import logging
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         self._setup_new_incident(mock_dedup_table, mock_window_table, mock_incident_table)
-        app._service_registry_table.update_item.side_effect = _other_dynamo_error()
+        registry_table(app).update_item.side_effect = _other_dynamo_error()
         with caplog.at_level(logging.WARNING):
-            app.handler(ALERT, None)
+            app.process(ALERT)
         assert "Service registry write failed" in caplog.text
         assert ALERT["affected_service"] in caplog.text
 
@@ -393,34 +382,10 @@ class TestServiceRegistry:
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         self._setup_new_incident(mock_dedup_table, mock_window_table, mock_incident_table)
         # Simulate the window between deploying the function and the table existing.
-        app._service_registry_table = None
         monkeypatch.delenv("SERVICE_REGISTRY_TABLE_NAME", raising=False)
-        result = app.handler(ALERT, None)
+        result = app.process(ALERT)
         assert result is not None
         mock_incident_table.put_item.assert_called_once()
-
-
-# ── Summarizer invocation tests ───────────────────────────────────────────────
-
-class TestSummarizerInvocation:
-    def test_summarizer_invoked_async_after_non_duplicate(self, dedup):
-        app, mock_dedup_table, mock_window_table, mock_incident_table, mock_lambda_client = dedup
-        mock_dedup_table.put_item.return_value = {}
-        mock_window_table.put_item.return_value = {}
-        mock_incident_table.put_item.return_value = {}
-        result = app.handler(ALERT, None)
-        mock_lambda_client.invoke.assert_called_once()
-        call_kwargs = mock_lambda_client.invoke.call_args[1]
-        assert call_kwargs["FunctionName"] == SUMMARIZER_FUNCTION
-        assert call_kwargs["InvocationType"] == "Event"
-        payload = json.loads(call_kwargs["Payload"])
-        assert payload["incident_id"] == result["incident_id"]
-
-    def test_summarizer_not_invoked_for_duplicate(self, dedup):
-        app, mock_dedup_table, mock_window_table, mock_incident_table, mock_lambda_client = dedup
-        mock_dedup_table.put_item.side_effect = _conditional_check_failed_error()
-        app.handler(ALERT, None)
-        mock_lambda_client.invoke.assert_not_called()
 
 
 # ── Recoveries (RC1-374) ─────────────────────────────────────────────────────
@@ -445,9 +410,9 @@ class TestRecovery:
         mock_incident_table.update_item.return_value = {}
 
     def test_recovery_closes_matching_open_incident(self, dedup):
-        app, mock_dedup_table, mock_window_table, mock_incident_table, mock_lambda = dedup
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         self._incidents(mock_incident_table, OPEN_INCIDENT)
-        result = app.handler(RESOLVED_ALERT, None)
+        result = app.process(RESOLVED_ALERT)
         assert result["resolved"] is True
         assert result["incident_id"] == "inc-open-1"
         assert result["alert_count"] == 2
@@ -460,67 +425,56 @@ class TestRecovery:
     def test_recovery_looks_up_by_service_index(self, dedup):
         app, _, _, mock_incident_table, _ = dedup
         self._incidents(mock_incident_table, OPEN_INCIDENT)
-        app.handler(RESOLVED_ALERT, None)
+        app.process(RESOLVED_ALERT)
         assert mock_incident_table.query.call_args[1]["IndexName"] == "service-created-index"
 
     def test_recovery_retires_window_and_fingerprint(self, dedup):
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         self._incidents(mock_incident_table, OPEN_INCIDENT)
-        app.handler(RESOLVED_ALERT, None)
+        app.process(RESOLVED_ALERT)
         mock_window_table.delete_item.assert_called_once()
         assert mock_window_table.delete_item.call_args[1]["Key"] == {"service_key": "payments-service"}
         mock_dedup_table.delete_item.assert_called_once_with(Key={"fingerprint": generate_fingerprint(
             ALERT["source"], ALERT["alert_name"], ALERT["affected_service"])})
         mock_dedup_table.put_item.assert_not_called()
 
-    def test_recovery_invokes_summarizer_with_flag(self, dedup):
-        app, _, _, mock_incident_table, mock_lambda = dedup
-        self._incidents(mock_incident_table, OPEN_INCIDENT)
-        app.handler(RESOLVED_ALERT, None)
-        mock_lambda.invoke.assert_called_once()
-        assert json.loads(mock_lambda.invoke.call_args[1]["Payload"]) == {"incident_id": "inc-open-1", "recovered": True}
-
     def test_recovery_with_no_open_incident_is_dropped(self, dedup, caplog):
-        app, mock_dedup_table, mock_window_table, mock_incident_table, mock_lambda = dedup
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         self._incidents(mock_incident_table)
         with caplog.at_level("INFO"):
-            assert app.handler(RESOLVED_ALERT, None) is None
+            assert app.process(RESOLVED_ALERT) is None
         mock_incident_table.update_item.assert_not_called()
         mock_incident_table.put_item.assert_not_called()
-        mock_lambda.invoke.assert_not_called()
         mock_dedup_table.put_item.assert_not_called()
         assert "no open incident" in caplog.text
 
     def test_recovery_ignores_resolved_and_unrelated_incidents(self, dedup):
-        app, _, _, mock_incident_table, mock_lambda = dedup
+        app, _, _, mock_incident_table, _ = dedup
         already = {**OPEN_INCIDENT, "incident_id": "inc-done", "status": "resolved"}
         other = {**OPEN_INCIDENT, "incident_id": "inc-other", "source_alerts": [
             {**OPEN_INCIDENT["source_alerts"][0], "alert_name": "different-alarm"}]}
         self._incidents(mock_incident_table, already, other)
-        assert app.handler(RESOLVED_ALERT, None) is None
-        mock_lambda.invoke.assert_not_called()
+        assert app.process(RESOLVED_ALERT) is None
 
     def test_duplicate_recovery_is_dropped_when_already_closed(self, dedup):
-        app, _, mock_window_table, mock_incident_table, mock_lambda = dedup
+        app, _, mock_window_table, mock_incident_table, _ = dedup
         self._incidents(mock_incident_table, OPEN_INCIDENT)
         mock_incident_table.update_item.side_effect = _conditional_check_failed_error()
-        assert app.handler(RESOLVED_ALERT, None) is None
-        mock_lambda.invoke.assert_not_called()
+        assert app.process(RESOLVED_ALERT) is None
         mock_window_table.delete_item.assert_not_called()
 
     def test_window_owned_by_newer_incident_is_left_alone(self, dedup):
-        app, _, mock_window_table, mock_incident_table, mock_lambda = dedup
+        app, _, mock_window_table, mock_incident_table, _ = dedup
         self._incidents(mock_incident_table, OPEN_INCIDENT)
         mock_window_table.delete_item.side_effect = _conditional_check_failed_error()
-        result = app.handler(RESOLVED_ALERT, None)
+        result = app.process(RESOLVED_ALERT)
         assert result["resolved"] is True
-        mock_lambda.invoke.assert_called_once()
 
     def test_open_alert_path_is_unchanged(self, dedup):
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         mock_dedup_table.put_item.return_value = {}
         mock_window_table.put_item.return_value = {}
         mock_incident_table.put_item.return_value = {}
-        result = app.handler(ALERT, None)
+        result = app.process(ALERT)
         assert result["is_new"] is True
         mock_incident_table.query.assert_not_called()

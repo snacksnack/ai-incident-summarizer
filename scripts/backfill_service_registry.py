@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Populate the service registry from incidents that already exist.
 
-The dedup Lambda registers a service whenever it opens a new incident, so the
+The ingest function registers a service whenever it opens a new incident, so the
 registry stays current by itself. This script seeds it for incidents written
 before that write path existed.
 
@@ -75,7 +75,7 @@ def backfill() -> None:
         table.update_item(
             Key={"affected_service": service},
             # if_not_exists on both attributes keeps this idempotent and stops a
-            # re-run from overwriting newer timestamps written by the dedup Lambda.
+            # re-run from overwriting newer timestamps written by the ingest function.
             UpdateExpression=(
                 "SET first_seen_at = if_not_exists(first_seen_at, :first), "
                 "last_seen_at = if_not_exists(last_seen_at, :last)"

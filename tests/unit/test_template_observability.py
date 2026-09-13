@@ -28,3 +28,12 @@ def test_one_service_name_for_apm_llm_obs_and_the_ml_app():
 def test_no_function_overrides_the_datadog_handler():
     resources = TEMPLATE.read_text().split("Resources:", 1)[1]
     assert not re.search(r"^\s+Handler:", resources, re.M)
+
+
+def test_two_functions_and_one_hand_off():
+    """RC1-431: ingest and summarizer, joined by exactly one async invoke. The
+    second lambda:InvokeFunction is EventBridge's permission on ingest."""
+    resources = TEMPLATE.read_text().split("Resources:", 1)[1]
+    functions = re.findall(r"^  (\w+):\n    Type: AWS::Serverless::Function", resources, re.M)
+    assert functions == ["IngestFunction", "SummarizerFunction"]
+    assert resources.count("Action: lambda:InvokeFunction") == 2

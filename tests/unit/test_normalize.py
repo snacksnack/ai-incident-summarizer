@@ -1,38 +1,17 @@
-import importlib
-import json
-import sys
-from unittest.mock import MagicMock, patch
-
 import pytest
 
-# conftest.py adds layers/common/python to sys.path
-
-DEDUP_FUNCTION_NAME = "dedup-function"
-
-
-def _load():
-    for mod in list(sys.modules):
-        if mod == "app" or mod.startswith("app."):
-            del sys.modules[mod]
-    sys.path.insert(0, "functions/normalizer")
-    import app
-    importlib.reload(app)
-    return app
+from tests.conftest import load_function_module
 
 
 @pytest.fixture()
-def mock_lambda(monkeypatch):
-    monkeypatch.setenv("DEDUP_FUNCTION_NAME", DEDUP_FUNCTION_NAME)
-    mock = MagicMock()
-    with patch("boto3.client", return_value=mock):
-        yield mock
+def normalizer():
+    return load_function_module("ingest", "normalize")
 
 
-@pytest.fixture()
-def normalizer(mock_lambda):
-    app = _load()
-    app._lambda_client = mock_lambda
-    return app
+def _run(normalizer, event: dict) -> dict | None:
+    """The normalized alert as the dict dedup receives, or None."""
+    alert = normalizer.normalize(event)
+    return None if alert is None else alert.to_dict()
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -112,45 +91,45 @@ def _gh_envelope(conclusion="failure", workflow_name="CI", repo="org/repo", acti
 
 class TestCloudWatch:
     def test_alarm_state_returns_open(self, normalizer):
-        result = normalizer.handler(_cw_event(state="ALARM"), None)
+        result = _run(normalizer, _cw_event(state="ALARM"))
         assert result["status"] == "open"
         assert result["source"] == "cloudwatch"
 
     def test_ok_state_returns_resolved(self, normalizer):
-        result = normalizer.handler(_cw_event(state="OK"), None)
+        result = _run(normalizer, _cw_event(state="OK"))
         assert result["status"] == "resolved"
 
     def test_insufficient_data_returns_open(self, normalizer):
-        result = normalizer.handler(_cw_event(state="INSUFFICIENT_DATA"), None)
+        result = _run(normalizer, _cw_event(state="INSUFFICIENT_DATA"))
         assert result["status"] == "open"
 
     def test_alarm_name_with_critical_keyword(self, normalizer):
-        result = normalizer.handler(_cw_event(alarm_name="payments-service-critical-errors"), None)
+        result = _run(normalizer, _cw_event(alarm_name="payments-service-critical-errors"))
         assert result["severity"] == "critical"
 
     def test_alarm_name_with_medium_keyword(self, normalizer):
-        result = normalizer.handler(_cw_event(alarm_name="api-medium-latency"), None)
+        result = _run(normalizer, _cw_event(alarm_name="api-medium-latency"))
         assert result["severity"] == "medium"
 
     def test_alarm_default_severity_is_high_for_alarm_state(self, normalizer):
-        result = normalizer.handler(_cw_event(alarm_name="no-keyword-alarm", state="ALARM"), None)
+        result = _run(normalizer, _cw_event(alarm_name="no-keyword-alarm", state="ALARM"))
         assert result["severity"] == "high"
 
     def test_service_extracted_from_dimensions(self, normalizer):
-        result = normalizer.handler(_cw_event(dimension_value="payments-service"), None)
+        result = _run(normalizer, _cw_event(dimension_value="payments-service"))
         assert result["affected_service"] == "payments-service"
 
     def test_alert_id_from_event_id(self, normalizer):
-        result = normalizer.handler(_cw_event(), None)
+        result = _run(normalizer, _cw_event())
         assert result["alert_id"] == "test-event-id-123"
 
     def test_raw_payload_is_full_event(self, normalizer):
         event = _cw_event()
-        result = normalizer.handler(event, None)
+        result = _run(normalizer, event)
         assert result["raw_payload"] == event
 
     def test_received_at_from_event_time(self, normalizer):
-        result = normalizer.handler(_cw_event(), None)
+        result = _run(normalizer, _cw_event())
         assert result["received_at"] == "2024-01-15T10:30:00Z"
 
 
@@ -158,159 +137,157 @@ class TestCloudWatch:
 
 class TestDatadog:
     def test_triggered_returns_open(self, normalizer):
-        result = normalizer.handler(_dd_envelope(transition="Triggered"), None)
+        result = _run(normalizer, _dd_envelope(transition="Triggered"))
         assert result["status"] == "open"
         assert result["source"] == "datadog"
 
     def test_re_triggered_returns_open(self, normalizer):
-        result = normalizer.handler(_dd_envelope(transition="Re-Triggered"), None)
+        result = _run(normalizer, _dd_envelope(transition="Re-Triggered"))
         assert result["status"] == "open"
 
     def test_recovered_returns_resolved(self, normalizer):
-        result = normalizer.handler(_dd_envelope(transition="Recovered"), None)
+        result = _run(normalizer, _dd_envelope(transition="Recovered"))
         assert result["status"] == "resolved"
 
     def test_p1_maps_to_critical(self, normalizer):
-        result = normalizer.handler(_dd_envelope(priority="P1"), None)
+        result = _run(normalizer, _dd_envelope(priority="P1"))
         assert result["severity"] == "critical"
 
     def test_p2_maps_to_high(self, normalizer):
-        result = normalizer.handler(_dd_envelope(priority="P2"), None)
+        result = _run(normalizer, _dd_envelope(priority="P2"))
         assert result["severity"] == "high"
 
     def test_p3_maps_to_medium(self, normalizer):
-        result = normalizer.handler(_dd_envelope(priority="P3"), None)
+        result = _run(normalizer, _dd_envelope(priority="P3"))
         assert result["severity"] == "medium"
 
     def test_p4_maps_to_low(self, normalizer):
-        result = normalizer.handler(_dd_envelope(priority="P4"), None)
+        result = _run(normalizer, _dd_envelope(priority="P4"))
         assert result["severity"] == "low"
 
     def test_alert_type_fallback_when_no_priority(self, normalizer):
         env = _dd_envelope(alert_type="warning")
         del env["raw_payload"]["priority"]
-        result = normalizer.handler(env, None)
+        result = _run(normalizer, env)
         assert result["severity"] == "medium"
 
     def test_service_extracted_from_tags(self, normalizer):
-        result = normalizer.handler(_dd_envelope(tags=["service:checkout-service", "env:prod"]), None)
+        result = _run(normalizer, _dd_envelope(tags=["service:checkout-service", "env:prod"]))
         assert result["affected_service"] == "checkout-service"
 
     def test_no_service_tag_returns_unknown(self, normalizer):
-        result = normalizer.handler(_dd_envelope(tags=["env:production"]), None)
+        result = _run(normalizer, _dd_envelope(tags=["env:production"]))
         assert result["affected_service"] == "unknown"
 
     def test_alert_id_from_payload_id(self, normalizer):
-        result = normalizer.handler(_dd_envelope(), None)
+        result = _run(normalizer, _dd_envelope())
         assert result["alert_id"] == "dd-alert-abc123"
 
     # RC1-370: the real webhook template renders $TAGS as one string, carries
     # the monitor id as alert_id, and prefixes titles with the transition.
     def test_tags_as_comma_separated_string(self, normalizer):
-        result = normalizer.handler(_dd_envelope(tags="env:prod, service:checkout-service,team:x"), None)
+        result = _run(normalizer, _dd_envelope(tags="env:prod, service:checkout-service,team:x"))
         assert result["affected_service"] == "checkout-service"
 
     def test_empty_tags_string_returns_unknown(self, normalizer):
         env = _dd_envelope()
         env["raw_payload"]["tags"] = ""  # a monitor with no tags renders $TAGS as ""
-        result = normalizer.handler(env, None)
+        result = _run(normalizer, env)
         assert result["affected_service"] == "unknown"
 
     def test_monitor_id_from_alert_id(self, normalizer):
         env = _dd_envelope()
         env["raw_payload"]["alert_id"] = "99999"
-        result = normalizer.handler(env, None)
+        result = _run(normalizer, env)
         assert result["monitor_id"] == "99999"
 
     def test_monitor_id_absent_when_payload_lacks_it(self, normalizer):
-        result = normalizer.handler(_dd_envelope(), None)
+        result = _run(normalizer, _dd_envelope())
         assert result["monitor_id"] is None
 
     def test_monitor_id_absent_when_rendered_empty(self, normalizer):
         env = _dd_envelope()
         env["raw_payload"]["alert_id"] = ""
-        result = normalizer.handler(env, None)
+        result = _run(normalizer, env)
         assert result["monitor_id"] is None
 
     def test_transition_prefix_stripped_from_alert_name(self, normalizer):
         env = _dd_envelope()
         env["raw_payload"]["title"] = "[Triggered on {service:payments-service}] Error rate above threshold"
-        result = normalizer.handler(env, None)
+        result = _run(normalizer, env)
         assert result["alert_name"] == "Error rate above threshold"
 
     def test_recovered_and_triggered_share_alert_name(self, normalizer):
         a = _dd_envelope(transition="Triggered"); a["raw_payload"]["title"] = "[Triggered] Latency"
         b = _dd_envelope(transition="Recovered"); b["raw_payload"]["title"] = "[Recovered] Latency"
-        assert normalizer.handler(a, None)["alert_name"] == normalizer.handler(b, None)["alert_name"] == "Latency"
+        assert _run(normalizer, a)["alert_name"] == _run(normalizer, b)["alert_name"] == "Latency"
 
     def test_warn_returns_open(self, normalizer):
-        assert normalizer.handler(_dd_envelope(transition="Warn"), None)["status"] == "open"
+        assert _run(normalizer, _dd_envelope(transition="Warn"))["status"] == "open"
 
     def test_no_data_returns_open(self, normalizer):
-        assert normalizer.handler(_dd_envelope(transition="No Data"), None)["status"] == "open"
+        assert _run(normalizer, _dd_envelope(transition="No Data"))["status"] == "open"
 
     def test_unknown_or_missing_transition_stays_open(self, normalizer):
         env = _dd_envelope()
         del env["raw_payload"]["alert_transition"]
-        assert normalizer.handler(env, None)["status"] == "open"
+        assert _run(normalizer, env)["status"] == "open"
 
 
 # ── GitHub Actions tests ──────────────────────────────────────────────────────
 
 class TestGitHub:
     def test_failure_returns_open_high(self, normalizer):
-        result = normalizer.handler(_gh_envelope(conclusion="failure"), None)
+        result = _run(normalizer, _gh_envelope(conclusion="failure"))
         assert result["status"] == "open"
         assert result["severity"] == "high"
         assert result["source"] == "github"
 
     def test_timed_out_returns_open_high(self, normalizer):
-        result = normalizer.handler(_gh_envelope(conclusion="timed_out"), None)
+        result = _run(normalizer, _gh_envelope(conclusion="timed_out"))
         assert result["status"] == "open"
         assert result["severity"] == "high"
 
     def test_cancelled_returns_open_medium(self, normalizer):
-        result = normalizer.handler(_gh_envelope(conclusion="cancelled"), None)
+        result = _run(normalizer, _gh_envelope(conclusion="cancelled"))
         assert result["status"] == "open"
         assert result["severity"] == "medium"
 
     def test_startup_failure_returns_open_high(self, normalizer):
-        result = normalizer.handler(_gh_envelope(conclusion="startup_failure"), None)
+        result = _run(normalizer, _gh_envelope(conclusion="startup_failure"))
         assert result["status"] == "open"
         assert result["severity"] == "high"
 
     def test_unknown_non_success_conclusion_returns_open_medium(self, normalizer):
-        result = normalizer.handler(_gh_envelope(conclusion="action_required"), None)
+        result = _run(normalizer, _gh_envelope(conclusion="action_required"))
         assert result["status"] == "open"
         assert result["severity"] == "medium"
 
     # RC1-373: only completed workflow runs are alerts. RC1-374: a successful
     # one is a recovery (status resolved) that dedup closes an incident with.
-    def test_success_is_a_recovery(self, normalizer, mock_lambda):
-        result = normalizer.handler(_gh_envelope(conclusion="success"), None)
+    def test_success_is_a_recovery(self, normalizer):
+        result = _run(normalizer, _gh_envelope(conclusion="success"))
         assert result["status"] == "resolved"
         assert result["severity"] == "low"
         assert result["alert_name"] == "CI"
-        mock_lambda.invoke.assert_called_once()
 
     def test_skipped_and_neutral_are_recoveries(self, normalizer):
-        assert normalizer.handler(_gh_envelope(conclusion="skipped"), None)["status"] == "resolved"
-        assert normalizer.handler(_gh_envelope(conclusion="neutral"), None)["status"] == "resolved"
+        assert _run(normalizer, _gh_envelope(conclusion="skipped"))["status"] == "resolved"
+        assert _run(normalizer, _gh_envelope(conclusion="neutral"))["status"] == "resolved"
 
-    def test_in_progress_run_is_ignored_without_error(self, normalizer, mock_lambda, caplog):
+    def test_in_progress_run_is_ignored_without_error(self, normalizer, caplog):
         env = _gh_envelope(action="in_progress")
         env["raw_payload"]["workflow_run"]["conclusion"] = None
         env["raw_payload"]["workflow_run"]["status"] = "in_progress"
         with caplog.at_level("INFO"):
-            assert normalizer.handler(env, None) is None
-        mock_lambda.invoke.assert_not_called()
+            assert _run(normalizer, env) is None
         assert "ERROR" not in caplog.text
         assert "Ignoring github workflow_run.in_progress" in caplog.text
 
     def test_requested_run_is_ignored(self, normalizer):
-        assert normalizer.handler(_gh_envelope(action="requested"), None) is None
+        assert _run(normalizer, _gh_envelope(action="requested")) is None
 
-    def test_workflow_job_event_is_ignored_without_error(self, normalizer, mock_lambda, caplog):
+    def test_workflow_job_event_is_ignored_without_error(self, normalizer, caplog):
         env = {
             "source": "github",
             "received_at": "2024-01-15T10:30:00+00:00",
@@ -320,11 +297,10 @@ class TestGitHub:
                             "repository": {"full_name": "org/repo"}},
         }
         with caplog.at_level("INFO"):
-            assert normalizer.handler(env, None) is None
-        mock_lambda.invoke.assert_not_called()
+            assert _run(normalizer, env) is None
         assert "ERROR" not in caplog.text
 
-    def test_push_event_is_ignored(self, normalizer, mock_lambda):
+    def test_push_event_is_ignored(self, normalizer):
         env = {
             "source": "github",
             "received_at": "2024-01-15T10:30:00+00:00",
@@ -332,35 +308,33 @@ class TestGitHub:
             "github_event": "push",
             "raw_payload": {"ref": "refs/heads/main", "commits": [], "repository": {"full_name": "org/repo"}},
         }
-        assert normalizer.handler(env, None) is None
-        mock_lambda.invoke.assert_not_called()
+        assert _run(normalizer, env) is None
 
-    def test_completed_run_without_conclusion_is_ignored(self, normalizer, mock_lambda):
+    def test_completed_run_without_conclusion_is_ignored(self, normalizer):
         env = _gh_envelope()
         env["raw_payload"]["workflow_run"]["conclusion"] = None
-        assert normalizer.handler(env, None) is None
-        mock_lambda.invoke.assert_not_called()
+        assert _run(normalizer, env) is None
 
     def test_missing_event_header_falls_back_to_payload_shape(self, normalizer):
         env = _gh_envelope(conclusion="failure")
         del env["github_event"]
-        assert normalizer.handler(env, None)["status"] == "open"
+        assert _run(normalizer, env)["status"] == "open"
 
     def test_missing_event_header_and_no_workflow_run_is_ignored(self, normalizer):
         env = {"source": "github", "received_at": "2024-01-15T10:30:00+00:00", "path": "/webhook/github",
                "raw_payload": {"action": "completed", "workflow_job": {}}}
-        assert normalizer.handler(env, None) is None
+        assert _run(normalizer, env) is None
 
     def test_affected_service_is_repo_full_name(self, normalizer):
-        result = normalizer.handler(_gh_envelope(repo="acme/payments-api"), None)
+        result = _run(normalizer, _gh_envelope(repo="acme/payments-api"))
         assert result["affected_service"] == "acme/payments-api"
 
     def test_alert_name_is_workflow_name(self, normalizer):
-        result = normalizer.handler(_gh_envelope(workflow_name="Deploy to Production"), None)
+        result = _run(normalizer, _gh_envelope(workflow_name="Deploy to Production"))
         assert result["alert_name"] == "Deploy to Production"
 
     def test_alert_id_from_run_id(self, normalizer):
-        result = normalizer.handler(_gh_envelope(), None)
+        result = _run(normalizer, _gh_envelope())
         assert result["alert_id"] == "1234567890"
 
 
@@ -368,26 +342,9 @@ class TestGitHub:
 
 class TestUnknownSource:
     def test_unknown_source_returns_none(self, normalizer):
-        result = normalizer.handler({"source": "pagerduty", "data": {}}, None)
+        result = _run(normalizer, {"source": "pagerduty", "data": {}})
         assert result is None
 
     def test_missing_source_returns_none(self, normalizer):
-        result = normalizer.handler({"data": "some payload"}, None)
+        result = _run(normalizer, {"data": "some payload"})
         assert result is None
-
-
-# ── Dedup invocation ──────────────────────────────────────────────────────────
-
-class TestDedupInvocation:
-    def test_valid_alert_invokes_dedup_async(self, normalizer, mock_lambda):
-        normalizer.handler(_cw_event(), None)
-        mock_lambda.invoke.assert_called_once()
-        call_kwargs = mock_lambda.invoke.call_args[1]
-        assert call_kwargs["FunctionName"] == DEDUP_FUNCTION_NAME
-        assert call_kwargs["InvocationType"] == "Event"
-        payload = json.loads(call_kwargs["Payload"])
-        assert payload["source"] == "cloudwatch"
-
-    def test_unknown_source_does_not_invoke_dedup(self, normalizer, mock_lambda):
-        normalizer.handler({"source": "unknown"}, None)
-        mock_lambda.invoke.assert_not_called()
