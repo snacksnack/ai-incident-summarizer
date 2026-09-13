@@ -412,6 +412,49 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
+  # ── This stack's own production alarms (RC1-435) ──
+  # The summarizer function is downstream of ingest, so its failures can be
+  # reported through the normal path: alarm -> EventBridge -> ingest -> incident
+  # row. The delivery of that incident runs on the summarizer itself, so if it
+  # is broken the incident still lands in the table and the dashboard, but not
+  # in Slack/Jira/Datadog. The DLQ alarm covers the one hop EventBridge can
+  # fail: an ingest invocation that could not be delivered. The names carry
+  # the severity keyword the normalizer reads ("high").
+
+  SummarizerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-summarizer-errors-high"
+      AlarmDescription: Summarizer function raised an unhandled error (all three Lambda attempts count), so an incident may be unsummarized or undelivered (RC1-435)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SummarizerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  IngestDLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ingest-dlq-depth-high"
+      AlarmDescription: EventBridge could not deliver a CloudWatch alarm event to the ingest function; the event is in IngestDLQ (RC1-435)
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt IngestDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
 Outputs:
   WebhookApiUrl:
     # The HTTP API's only stage is `prod`, and a named stage is part of the

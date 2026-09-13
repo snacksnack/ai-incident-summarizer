@@ -12,7 +12,7 @@ Built with AWS Lambda (Python), SAM, DynamoDB, Claude, Next.js, and Vercel.
 
 | Source | Role | Integration |
 |---|---|---|
-| **CloudWatch** | Every alarm in the AWS account. The EventBridge rule matches `CloudWatch Alarm State Change` with no alarm-name filter, so an alarm feeds this pipeline the moment it exists; there is nothing to wire per alarm. Today that is the three `stale-ticket-bot-*` alarms plus this stack's own self-test alarm (see below) | Native EventBridge |
+| **CloudWatch** | Every alarm in the AWS account. The EventBridge rule matches `CloudWatch Alarm State Change` with no alarm-name filter, so an alarm feeds this pipeline the moment it exists; there is nothing to wire per alarm. Today that is the three `stale-ticket-bot-*` alarms, this stack's two own alarms and its self-test alarm (see below) | Native EventBridge |
 | **Datadog** | Synthetics uptime and TLS checks, CI Visibility (deploy and pipeline failures) and the LLM spend monitors; see `scripts/wire_datadog_monitors.py` for the exact set | Webhook via API Gateway |
 | **GitHub Actions** | CI/CD pipeline failures — only `workflow_run.completed` events; a failed run opens an incident, a successful one is a recovery that closes it; in-progress runs, `workflow_job` and `push` deliveries are ignored | Webhook via API Gateway |
 
@@ -24,6 +24,8 @@ not anything in this repo. As of 2026-09-13 that set is:
 |---|---|---|
 | `stale-ticket-bot-lambda-errors` | stale-ticket-bot stack | Production source. Opened one incident per weekday 2026-09-03 to 2026-09-11 (INC-76, 77, 88, 91, 93, 94, 96), each delivered to Slack, Jira and Datadog and closed by the alarm's own recovery 18 minutes later. That is the live proof of the path. |
 | `stale-ticket-bot-dlq-depth`, `stale-ticket-bot-missing-invocation` | stale-ticket-bot stack | Production sources; no state change since 2026-07-09 |
+| `ai-incident-summarizer-summarizer-errors-high` | this stack | Production source. Unhandled error in the summarizer function. Ingest writes the incident either way; delivery to Slack/Jira/Datadog needs the summarizer, so check the dashboard if the thread never appears |
+| `ai-incident-summarizer-ingest-dlq-depth-high` | this stack | Production source. EventBridge could not deliver an alarm event to ingest; the event is in `IngestDLQ` |
 | `ai-incident-summarizer-test-alarm` | this stack | **Self-test only.** Alarms on the ingest function's own `Errors`, so a real ingest failure would try to report itself through the failing function. Flip it with `set-alarm-state` to verify the EventBridge rule; it is not a production source |
 | `BillingAlarm` | account, 2022 | Dormant (`INSUFFICIENT_DATA` since 2022) |
 
