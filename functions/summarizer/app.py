@@ -7,6 +7,7 @@ from botocore.exceptions import ClientError
 
 from common import aws
 from common.duration import incident_duration
+from common import recurrence as recurrence_text
 from delivery import datadog_events, jira, slack
 
 logger = logging.getLogger()
@@ -40,6 +41,13 @@ def _build_prompt(incident: dict) -> str:
     first_seen = alerts[0]["received_at"] if alerts else "unknown"
     last_seen = alerts[-1]["received_at"] if len(alerts) > 1 else first_seen
 
+    recurring = recurrence_text.sentence(incident)
+    recurrence_line = (
+        f"\n- Recurrence: {recurring} Treat it as a recurring problem: say so in the summary, "
+        "and make the next step about breaking the pattern, not about triage."
+        if recurring else ""
+    )
+
     return f"""You are an on-call engineer assistant. Analyze this incident and produce a structured operational summary.
 
 Incident:
@@ -48,7 +56,7 @@ Incident:
 - Alert count: {len(alerts)}
 - Alerts: {alert_names}
 - First seen: {first_seen}
-- Last seen: {last_seen}
+- Last seen: {last_seen}{recurrence_line}
 
 Respond with a JSON object containing exactly these three fields:
 {{

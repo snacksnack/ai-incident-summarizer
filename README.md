@@ -30,8 +30,12 @@ not anything in this repo. As of 2026-09-13 that set is:
 | `BillingAlarm` | account, 2022 | Dormant (`INSUFFICIENT_DATA` since 2022) |
 
 The normalizer names the affected service after the alarm's first metric
-dimension (a Lambda function's physical name, a queue name), and severity from a
-keyword in the alarm name, defaulting to `high` in `ALARM` and `low` in `OK`.
+dimension, reduced to the CloudFormation stack when the value is a generated
+physical name (`stale-ticket-bot-StaleTicketBotFunction-G8cd3Ax5XBMd` →
+`stale-ticket-bot`, `ai-incident-summarizer-IngestDLQ-CHgswNqI8tXR` →
+`ai-incident-summarizer`; any other value is kept as is, and an alarm with no
+dimensions uses its own name). Severity comes from a keyword in the alarm name,
+defaulting to `high` in `ALARM` and `low` in `OK`.
 
 ---
 
@@ -61,6 +65,7 @@ State is DynamoDB: one TTL-gated alert-state table (`fp#` rows that suppress a r
 | `slack_thread_id` | Enables Slack reply threading |
 | `jira_ticket_id` | Linked Jira ticket |
 | `datadog_event_id` | Latest Datadog event posted for this incident (all its events share `aggregation_key` `incident:<id>`) |
+| `recurrence` | Present when the same alert opened other incidents for this service in the last 7 days (RC1-437): `count_7d`, `previous_incident_id`, `previous_created_at`, `previous_jira_ticket_id` when it had one. Ingest computes it from `service-created-index` at creation; the summary prompt, the Slack header ("7th time in 7 days (previous: INC-96)"), the Jira title and description, and the Datadog event tag `recurrence_7d` all read it. Derived data: a lookup failure leaves it out and the incident is still written. |
 | `created_at` | ISO timestamp |
 | `ttl` | Optional expiry timestamp. TTL is enabled on the table, so any incident carrying this attribute is deleted by DynamoDB once it passes. Neither the pipeline nor the seed script sets it — omit it unless you want the incident to disappear. |
 

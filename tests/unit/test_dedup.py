@@ -2,6 +2,7 @@ import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+from boto3.dynamodb.conditions import ConditionExpressionBuilder
 from botocore.exceptions import ClientError
 
 from common import aws
@@ -65,6 +66,11 @@ def _conditional_check_failed_error():
 def _other_dynamo_error():
     error_response = {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "Throughput exceeded"}}
     return ClientError(error_response, "PutItem")
+
+
+def _key_names(condition) -> set[str]:
+    built = ConditionExpressionBuilder().build_expression(condition, is_key_condition=True)
+    return set(built.attribute_name_placeholders.values())
 
 
 ALERT_STATE_TABLE = "test-alert-state-table"
@@ -491,10 +497,103 @@ class TestRecovery:
         assert result["resolved"] is True
 
     def test_open_alert_path_is_unchanged(self, dedup):
+        # An open alert never looks for an incident to close; the only query
+        # it makes is the recurrence lookup (RC1-437), which is bounded to the
+        # last 7 days and touches nothing.
         app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
         mock_dedup_table.put_item.return_value = {}
         mock_window_table.put_item.return_value = {}
         mock_incident_table.put_item.return_value = {}
         result = app.process(ALERT)
         assert result["is_new"] is True
+        assert "resolved" not in result
+        mock_incident_table.update_item.assert_not_called()
+        for call in mock_incident_table.query.call_args_list:
+            assert "created_at" in _key_names(call.kwargs["KeyConditionExpression"])
+
+
+# ── Recurrence (RC1-437) ──────────────────────────────────────────────────────
+
+def _prior(incident_id, alert_name=ALERT["alert_name"], source=ALERT["source"], created_at="2024-01-14T10:30:00Z", jira=None):
+    incident = {
+        "incident_id": incident_id,
+        "affected_service": ALERT["affected_service"],
+        "status": "resolved",
+        "created_at": created_at,
+        "source_alerts": [{"alert_id": "x", "source": source, "alert_name": alert_name, "severity": "high", "status": "open", "received_at": created_at}],
+    }
+    if jira:
+        incident["jira_ticket_id"] = jira
+    return incident
+
+
+class TestRecurrence:
+    def _new_incident(self, dedup, prior_items):
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
+        mock_dedup_table.put_item.return_value = {}
+        mock_window_table.put_item.return_value = {}
+        mock_incident_table.put_item.return_value = {}
+        mock_incident_table.query.return_value = {"Items": prior_items}
+        app.process(ALERT)
+        return mock_incident_table
+
+    def test_repeat_of_the_same_alert_is_counted_and_points_at_the_newest(self, dedup):
+        table = self._new_incident(dedup, [
+            _prior("inc-newest", created_at="2024-01-15T09:00:00Z", jira="INC-96"),
+            _prior("inc-older", created_at="2024-01-14T09:00:00Z", jira="INC-94"),
+        ])
+        item = table.put_item.call_args[1]["Item"]
+        assert item["recurrence"] == {
+            "count_7d": 2,
+            "previous_incident_id": "inc-newest",
+            "previous_created_at": "2024-01-15T09:00:00Z",
+            "previous_jira_ticket_id": "INC-96",
+        }
+
+    def test_other_alerts_for_the_service_do_not_count(self, dedup):
+        table = self._new_incident(dedup, [
+            _prior("inc-1", alert_name="some-other-alarm"),
+            _prior("inc-2", source="datadog"),
+        ])
+        assert "recurrence" not in table.put_item.call_args[1]["Item"]
+
+    def test_first_occurrence_has_no_recurrence_field(self, dedup):
+        table = self._new_incident(dedup, [])
+        assert "recurrence" not in table.put_item.call_args[1]["Item"]
+
+    def test_previous_without_a_ticket_omits_the_key(self, dedup):
+        table = self._new_incident(dedup, [_prior("inc-1")])
+        recurrence = table.put_item.call_args[1]["Item"]["recurrence"]
+        assert recurrence["count_7d"] == 1
+        assert "previous_jira_ticket_id" not in recurrence
+
+    def test_lookup_is_bounded_to_the_window_on_the_service_index(self, dedup):
+        table = self._new_incident(dedup, [])
+        kwargs = table.query.call_args[1]
+        assert kwargs["IndexName"] == "service-created-index"
+        assert kwargs["ScanIndexForward"] is False
+        assert _key_names(kwargs["KeyConditionExpression"]) == {"affected_service", "created_at"}
+
+    def test_lookup_failure_still_writes_the_incident(self, dedup, caplog):
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
+        mock_dedup_table.put_item.return_value = {}
+        mock_window_table.put_item.return_value = {}
+        mock_incident_table.put_item.return_value = {}
+        mock_incident_table.query.side_effect = _other_dynamo_error()
+        with caplog.at_level("WARNING"):
+            result = app.process(ALERT)
+        assert result["is_new"] is True
+        mock_incident_table.put_item.assert_called_once()
+        assert "recurrence" not in mock_incident_table.put_item.call_args[1]["Item"]
+        assert "Recurrence lookup failed" in caplog.text
+
+    def test_joining_an_open_window_does_not_look_up(self, dedup):
+        app, mock_dedup_table, mock_window_table, mock_incident_table, _ = dedup
+        mock_dedup_table.put_item.return_value = {}
+        mock_window_table.put_item.side_effect = _conditional_check_failed_error()
+        mock_window_table.update_item.return_value = {
+            "Attributes": {"incident_id": "inc-123", "alert_count": 2, "service_key": ALERT["affected_service"]}
+        }
+        mock_incident_table.update_item.return_value = {}
+        app.process(ALERT)
         mock_incident_table.query.assert_not_called()

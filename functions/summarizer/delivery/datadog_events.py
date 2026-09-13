@@ -136,6 +136,9 @@ def _build_tags(incident: dict, recovered: bool = False) -> list[str]:
         tags.append(f"env:{env}")
     if incident.get("jira_ticket_id"):
         tags.append(f"jira_ticket:{incident['jira_ticket_id']}")
+    count = (incident.get("recurrence") or {}).get("count_7d")
+    if count:
+        tags.append(f"recurrence_7d:{int(count) + 1}")
     # For Datadog-sourced alerts: alert_id is the monitor *event* that opened
     # this incident (a row in the same stream this summary lands in), and
     # monitor_id is the monitor itself, stable across trigger and recovery.

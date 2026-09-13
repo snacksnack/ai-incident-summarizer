@@ -147,6 +147,16 @@ class TestMessageFormat:
         slack, _, _ = notifier
         assert "2024-01-15T10:00:00Z" in slack._build_message(INCIDENT)
 
+    def test_header_carries_the_repeat_and_the_previous_ticket(self, notifier):
+        slack, _, _ = notifier
+        incident = {**INCIDENT, "recurrence": {"count_7d": 6, "previous_incident_id": "p", "previous_created_at": "x", "previous_jira_ticket_id": "INC-96"}}
+        text = slack._build_message(incident)
+        assert text.startswith("🟠 *HIGH* | payments-service | 2024-01-15T10:00:00Z | 🔁 7th time in 7 days (previous: INC-96)")
+
+    def test_header_without_recurrence_is_unchanged(self, notifier):
+        slack, _, _ = notifier
+        assert slack._build_message(INCIDENT).startswith("🟠 *HIGH* | payments-service | 2024-01-15T10:00:00Z\n")
+
     def test_message_includes_llm_summary_fields(self, notifier):
         slack, _, _ = notifier
         msg = slack._build_message(INCIDENT)
