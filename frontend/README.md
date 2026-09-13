@@ -1,36 +1,38 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Incident history UI
 
-## Getting Started
+Next.js app on Vercel that lists the incidents the pipeline wrote to DynamoDB
+and shows one incident with its summary, Slack thread and Jira links. The API
+routes under `app/api/` read DynamoDB directly; nothing else in the stack is
+called.
 
-First, run the development server:
+## Running locally
 
 ```bash
+vercel link                        # once
+vercel env pull .env.local --yes   # table names, links, and a VERCEL_OIDC_TOKEN (~12 h)
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+AWS access is keyless: `lib/dynamodb.ts` exchanges the Vercel OIDC token for
+credentials on the stack's `DashboardReadRole` (see the root README, "Dashboard
+access to DynamoDB"). When the API routes start failing with a credentials
+error after a long session, the token has expired; pull again. There is no
+`AWS_ACCESS_KEY_ID` to set.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Environment variables
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Variable | Purpose |
+|---|---|
+| `AWS_ROLE_ARN` | `DashboardReadRoleArn` output of the SAM stack |
+| `AWS_REGION` | `us-east-1` |
+| `INCIDENT_TABLE_NAME`, `SERVICE_REGISTRY_TABLE_NAME` | Physical table names from the stack outputs |
+| `NEXT_PUBLIC_SLACK_CHANNEL_ID`, `NEXT_PUBLIC_JIRA_BASE_URL` | Deep links on the incident page |
+| `VERCEL_OIDC_TOKEN` | Injected by Vercel; locally provisioned by `vercel env pull` |
 
-## Learn More
+## Deploying
 
-To learn more about Next.js, take a look at the following resources:
+`deploy.yml` at the repo root runs `vercel --prod` after the SAM deploy on every
+push to `main`. Preview deployments cannot assume the read role by design.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+This is Next.js 16; read `node_modules/next/dist/docs/` before changing app
+code, the conventions differ from older versions.

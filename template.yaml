@@ -41,6 +41,17 @@ Parameters:
     Type: String
     Description: Base URL of the incident history UI, linked from Datadog events (empty to omit the link)
     Default: https://incidents.hihelloreid.com
+  VercelTeamSlug:
+    Type: String
+    Description: >-
+      Vercel team slug (the "owner" in an OIDC subject claim). Together with
+      VercelProjectName it pins DashboardReadRole's trust policy to one Vercel
+      project; a blanket trust of oidc.vercel.com would let any Vercel account
+      assume the role.
+  VercelProjectName:
+    Type: String
+    Default: ai-incident-summarizer
+    Description: Vercel project name of the dashboard, as it appears in the OIDC subject claim
 
 Globals:
   Function:
@@ -454,6 +465,78 @@ Resources:
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
+  # ── Dashboard read access via Vercel OIDC federation (RC1-220, folds in RC1-219) ──
+  # The Next.js API routes on Vercel read DynamoDB directly. Until RC1-220 they
+  # did so as the hand-made IAM user incident-dashboard-readonly with static
+  # access keys in Vercel's environment and an inline policy nobody could see
+  # from this repo (RC1-218 broke on exactly that). Now Vercel's per-invocation
+  # OIDC token is exchanged with STS for credentials on this role, so no
+  # long-lived key exists anywhere, and the grant lives next to the tables it
+  # covers. The role is also assumable from a developer's machine through
+  # `vercel env pull`, which mints a development-environment token; preview
+  # deployments are deliberately excluded so a branch cannot read production
+  # data. Condition keys are per issuer, so the trust policy is a JSON string.
+
+  VercelOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: !Sub https://oidc.vercel.com/${VercelTeamSlug}
+      ClientIdList:
+        - !Sub https://vercel.com/${VercelTeamSlug}
+      # SHA-1 of the CA that signs oidc.vercel.com (Let's Encrypt root, captured
+      # 2026-09-13). AWS validates Let's Encrypt-issued IdPs against its own
+      # trusted-CA list since 2024, so this value is required but not load-bearing.
+      ThumbprintList:
+        - AB9D0263244DD0326EB67015705A667E79CFE998
+
+  DashboardReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-dashboard-read
+      Description: Read-only DynamoDB access for the incident dashboard on Vercel, assumed with the deployment's OIDC token
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Federated": "${VercelOidcProvider}" },
+              "Action": "sts:AssumeRoleWithWebIdentity",
+              "Condition": {
+                "StringEquals": {
+                  "oidc.vercel.com/${VercelTeamSlug}:aud": "https://vercel.com/${VercelTeamSlug}",
+                  "oidc.vercel.com/${VercelTeamSlug}:sub": [
+                    "owner:${VercelTeamSlug}:project:${VercelProjectName}:environment:production",
+                    "owner:${VercelTeamSlug}:project:${VercelProjectName}:environment:development"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      Policies:
+        - PolicyName: DynamoDBReadOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # /api/incidents queries the GSIs, /api/incidents/[id] gets one
+              # item. No Scan on the incident table: the incidents route was
+              # moved to Query in RC1-218 precisely to avoid scan cost.
+              - Sid: ReadIncidents
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt IncidentTable.Arn
+                  - !Sub ${IncidentTable.Arn}/index/*
+              # /api/services scans the registry; it is small by design.
+              - Sid: ReadServiceRegistry
+                Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                Resource: !GetAtt ServiceRegistryTable.Arn
 
 Outputs:
   WebhookApiUrl:
@@ -475,3 +558,6 @@ Outputs:
   ServiceRegistryTableName:
     Description: DynamoDB service registry table name
     Value: !Ref ServiceRegistryTable
+  DashboardReadRoleArn:
+    Description: Set as AWS_ROLE_ARN in the Vercel project (production + development)
+    Value: !GetAtt DashboardReadRole.Arn

@@ -137,6 +137,34 @@ Set by `template.yaml`; the SAM parameters in `samconfig.toml` supply the values
 | `INCIDENT_DASHBOARD_URL` | summarizer | Linked from Datadog events (empty omits the link) |
 | `DD_API_KEY_SECRET_ARN`, `DD_*`, `POWERTOOLS_SERVICE_NAME` | both (Globals) | Datadog wrapper, tracing and LLM Observability; the Datadog events writer reuses the same key |
 
+### Dashboard access to DynamoDB (Vercel OIDC, RC1-220)
+
+The Next.js API routes on Vercel read the incident and registry tables
+directly. They do it as `DashboardReadRole`, defined in `template.yaml` next to
+the tables it may read, and they get credentials for it by exchanging the
+short-lived OIDC token Vercel injects into every invocation
+(`VERCEL_OIDC_TOKEN`) with STS. There is no IAM user and no static access key
+anywhere: the role's trust policy accepts tokens from this Vercel team and
+project only, for the `production` and `development` environments. Preview
+deployments are excluded on purpose, so a branch cannot read production data.
+
+Requirements on the Vercel side, once:
+
+- Project settings → Security → **Secure Backend Access with OIDC Federation**
+  enabled, issuer mode *Team* (the trust policy expects
+  `https://oidc.vercel.com/<team-slug>`).
+- Environment variables for Production and Development: `AWS_ROLE_ARN` (the
+  `DashboardReadRoleArn` stack output), `AWS_REGION`, `INCIDENT_TABLE_NAME`,
+  `SERVICE_REGISTRY_TABLE_NAME`, plus the `NEXT_PUBLIC_SLACK_CHANNEL_ID` and
+  `NEXT_PUBLIC_JIRA_BASE_URL` links. No `AWS_ACCESS_KEY_ID` or
+  `AWS_SECRET_ACCESS_KEY`; if they are present the SDK still prefers the
+  explicit provider, but they should not exist.
+
+Granting the dashboard a new table is a template change to
+`DashboardReadRole`'s policy, reviewed in the same PR as the table. RC1-218
+failed at runtime with a 500 because the old inline policy lived only in the
+console.
+
 ## Local development
 
 ```bash
@@ -149,6 +177,22 @@ sam local invoke IngestFunction --event events/cloudwatch.json
 # Deploy to AWS
 sam deploy --guided
 ```
+
+Frontend:
+
+```bash
+cd frontend
+vercel link                           # once; picks the ai-incident-summarizer project
+vercel env pull .env.local --yes      # env vars + a VERCEL_OIDC_TOKEN good for ~12 h
+npm run dev
+```
+
+The OIDC token in `.env.local` expires after about 12 hours. The symptom is an
+STS or DynamoDB credentials error from the API routes, not an obvious expiry
+message; re-run `vercel env pull .env.local --yes`. The pull rewrites the whole
+file, so keep hand-added variables in `.env.development.local` instead. The
+Python scripts under `scripts/` use a normal AWS profile through boto3 and are
+unaffected.
 
 ---
 
