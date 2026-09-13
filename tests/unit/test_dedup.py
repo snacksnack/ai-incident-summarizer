@@ -19,7 +19,6 @@ ALERT = {
     "received_at": "2024-01-15T10:30:00Z",
 }
 
-DEDUP_TABLE = "test-dedup-table"
 WINDOW_MINUTES = "5"
 
 
@@ -68,33 +67,54 @@ def _other_dynamo_error():
     return ClientError(error_response, "PutItem")
 
 
-CORRELATION_TABLE = "test-correlation-table"
+ALERT_STATE_TABLE = "test-alert-state-table"
 INCIDENT_TABLE = "test-incident-table"
 SERVICE_REGISTRY_TABLE = "test-service-registry-table"
 
 
+class RoutedStateTable:
+    """The one alert-state table (RC1-432), split back into a fingerprint mock
+    and a window mock by key prefix, so each test can still set up and assert
+    the two kinds of row separately."""
+
+    def __init__(self):
+        self.fingerprints = MagicMock()
+        self.windows = MagicMock()
+
+    def _side(self, kwargs):
+        pk = (kwargs.get("Item") or kwargs.get("Key"))["pk"]
+        assert pk.startswith(("fp#", "window#")), pk
+        return self.fingerprints if pk.startswith("fp#") else self.windows
+
+    def put_item(self, **kwargs):
+        return self._side(kwargs).put_item(**kwargs)
+
+    def update_item(self, **kwargs):
+        return self._side(kwargs).update_item(**kwargs)
+
+    def delete_item(self, **kwargs):
+        return self._side(kwargs).delete_item(**kwargs)
+
+
 @pytest.fixture()
 def dedup(monkeypatch):
-    monkeypatch.setenv("DEDUP_TABLE_NAME", DEDUP_TABLE)
-    monkeypatch.setenv("CORRELATION_TABLE_NAME", CORRELATION_TABLE)
+    monkeypatch.setenv("ALERT_STATE_TABLE_NAME", ALERT_STATE_TABLE)
     monkeypatch.setenv("INCIDENT_TABLE_NAME", INCIDENT_TABLE)
     monkeypatch.setenv("SERVICE_REGISTRY_TABLE_NAME", SERVICE_REGISTRY_TABLE)
     monkeypatch.setenv("CORRELATION_WINDOW_MINUTES", WINDOW_MINUTES)
     aws.reset()
-    mock_dedup_table = MagicMock()
-    mock_window_table = MagicMock()
+    state = RoutedStateTable()
     mock_incident_table = MagicMock()
     mock_registry_table = MagicMock()
     aws._tables.update({
-        DEDUP_TABLE: mock_dedup_table,
-        CORRELATION_TABLE: mock_window_table,
+        ALERT_STATE_TABLE: state,
         INCIDENT_TABLE: mock_incident_table,
         SERVICE_REGISTRY_TABLE: mock_registry_table,
     })
     app = load_function_module("ingest", "dedup")
-    # Reached via registry_table() rather than the fixture tuple, to keep the
-    # existing unpackings in this file unchanged.
-    yield app, mock_dedup_table, mock_window_table, mock_incident_table, mock_registry_table
+    # The tuple keeps the fingerprint side and the window side apart, as the
+    # tests were written; registry_table() reaches the fifth mock.
+    yield app, state.fingerprints, state.windows, mock_incident_table, mock_registry_table
 
 
 def registry_table(app) -> MagicMock:
@@ -135,9 +155,9 @@ class TestDedupHandler:
         app.process(ALERT)
         mock_dedup_table.put_item.assert_called_once()
         call_kwargs = mock_dedup_table.put_item.call_args[1]
-        assert call_kwargs["Item"]["fingerprint"] == generate_fingerprint(
-            ALERT["source"], ALERT["alert_name"], ALERT["affected_service"]
-        )
+        fingerprint = generate_fingerprint(ALERT["source"], ALERT["alert_name"], ALERT["affected_service"])
+        assert call_kwargs["Item"]["pk"] == f"fp#{fingerprint}"
+        assert call_kwargs["Item"]["fingerprint"] == fingerprint
         assert "ConditionExpression" in call_kwargs  # shape asserted in test_condition_accepts_missing_or_expired_fingerprint
 
     def test_duplicate_returns_none(self, dedup):
@@ -176,7 +196,7 @@ class TestDedupHandler:
         names = {v: k for k, v in built.attribute_name_placeholders.items()}
         values = built.attribute_value_placeholders
         expr = built.condition_expression
-        assert expr == f"(attribute_not_exists({names['fingerprint']}) OR {names['ttl']} <= :v0)"
+        assert expr == f"(attribute_not_exists({names['pk']}) OR {names['ttl']} <= :v0)"
         assert values[":v0"] == 1_700_000_000
 
     def test_ttl_equals_now_plus_window(self, dedup):
@@ -433,8 +453,8 @@ class TestRecovery:
         self._incidents(mock_incident_table, OPEN_INCIDENT)
         app.process(RESOLVED_ALERT)
         mock_window_table.delete_item.assert_called_once()
-        assert mock_window_table.delete_item.call_args[1]["Key"] == {"service_key": "payments-service"}
-        mock_dedup_table.delete_item.assert_called_once_with(Key={"fingerprint": generate_fingerprint(
+        assert mock_window_table.delete_item.call_args[1]["Key"] == {"pk": "window#payments-service"}
+        mock_dedup_table.delete_item.assert_called_once_with(Key={"pk": "fp#" + generate_fingerprint(
             ALERT["source"], ALERT["alert_name"], ALERT["affected_service"])})
         mock_dedup_table.put_item.assert_not_called()
 
