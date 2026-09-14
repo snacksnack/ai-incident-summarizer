@@ -87,8 +87,9 @@ Each function pins its own `requirements.txt`; shared code is in the layer.
 
 - `python -m pytest tests/ -v` — `tests/unit/` is offline, `tests/integration/`
   uses moto for DynamoDB. Deps: `tests/requirements-test.txt`.
-- `sam validate --lint` runs in CI; it catches template errors a green deploy
-  hides.
+- `sam validate --lint` runs in CI; catches template errors a deploy hides.
+- `cd frontend && npm test` — Vitest+RTL, offline; CI adds `tsc`/`eslint`
+  (RC1-222).
 - `python -m evals` is **billed**; needs `ANTHROPIC_API_KEY` plus
   `requirements-evals.txt`; it scores the shipped prompt on real output and
   records to the shared agent-evals store as subject `incident-summary`.
@@ -106,7 +107,6 @@ sam deploy --no-confirm-changeset          # CI does this on push to main
 
 One branch per ticket, `rc1-NNN-slug`; never commit on `main`. Commit subject
 `RC1-NNN: what changed`, short body, **no Co-Authored-By trailer**. Claude
-opens the PR; Reid merges. `ci.yml` runs tests plus `sam validate` on every
-push and PR; `deploy.yml` runs `sam build` + `sam deploy` on push to `main`,
-then ships the frontend to Vercel. A green CloudFormation deploy is not proof
-the functions run — verify an invocation.
+opens the PR; Reid merges. `ci.yml` gates every PR; `deploy.yml` runs
+`sam build` + `sam deploy` on push to `main`, then the frontend to Vercel. A
+CloudFormation deploy is not proof the functions run — invoke one.

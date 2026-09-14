@@ -36,3 +36,19 @@ push to `main`. Preview deployments cannot assume the read role by design.
 
 This is Next.js 16; read `node_modules/next/dist/docs/` before changing app
 code, the conventions differ from older versions.
+
+## Tests
+
+```bash
+npm test          # vitest run — offline, no credentials
+npx tsc --noEmit
+npm run lint
+```
+
+Unit tests sit beside the code they cover (`app/page.test.tsx`,
+`app/api/incidents/route.test.ts`). Components render under jsdom with
+`fetch` stubbed; route handlers import `GET` directly and run against a mocked
+DynamoDB document client (`aws-sdk-client-mock`), so the real query
+construction in the handler is what gets checked. CI runs all three commands
+on every pull request and fails on any finding (RC1-222). Out of scope by
+design: browser end-to-end tests and visual regression.
