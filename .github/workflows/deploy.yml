@@ -45,8 +45,27 @@ jobs:
       - name: SAM build
         run: sam build
 
+      # DORA needs the deploy's start time; GITHUB_ENV is the only state that
+      # survives between steps.
+      - name: Record deploy start
+        run: echo "DEPLOY_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: SAM deploy
         run: sam deploy --no-confirm-changeset --no-fail-on-empty-changeset
+
+      # The 401 comes from the ingest function itself: the Datadog webhook
+      # without its secret. That proves the new code imports, reads Secrets
+      # Manager and answers. API Gateway alone would say 404 or 5xx.
+      - name: Gate on the ingest function answering
+        run: |
+          url=$(aws cloudformation describe-stacks --stack-name ai-incident-summarizer \
+            --query "Stacks[0].Outputs[?OutputKey=='WebhookApiUrl'].OutputValue" --output text)
+          scripts/wait_for_http.sh POST "$url/webhook/datadog" 401
+
+      - name: Report deploy to Datadog DORA
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+        run: scripts/report_dora_deployment.sh incident-summarizer "$DEPLOY_STARTED_AT"
 
   deploy-frontend:
     runs-on: ubuntu-latest
@@ -59,6 +78,9 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Record deploy start
+        run: echo "DEPLOY_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Deploy frontend to Vercel
         working-directory: frontend
         env:
@@ -66,3 +88,13 @@ jobs:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: npx vercel@latest --prod --token "$VERCEL_TOKEN"
+
+      # /api/incidents assumes DashboardReadRole via Vercel OIDC and reads
+      # DynamoDB, so a 200 there is the whole read path, not just a static page.
+      - name: Gate on the dashboard serving incidents
+        run: scripts/wait_for_http.sh GET https://incidents.hihelloreid.com/api/incidents 200
+
+      - name: Report deploy to Datadog DORA
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+        run: scripts/report_dora_deployment.sh incidents-hihelloreid "$DEPLOY_STARTED_AT"

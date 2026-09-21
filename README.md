@@ -114,7 +114,7 @@ ai-incident-summarizer/
 │               ├── fingerprint.py  # SHA-256 alert identity
 │               └── duration.py     # human-readable incident duration
 ├── evals/                     # the billed agent-evals subject (incident-summary)
-├── scripts/                   # Datadog webhook + monitor wiring, dashboard seed, registry backfill
+├── scripts/                   # Datadog webhook + monitor wiring, dashboard seed, registry backfill, deploy gate + DORA report
 ├── frontend/                  # Next.js incident history UI, deployed to Vercel
 └── tests/
     ├── unit/
@@ -205,6 +205,20 @@ message; re-run `vercel env pull .env.local --yes`. The pull rewrites the whole
 file, so keep hand-added variables in `.env.development.local` instead. The
 Python scripts under `scripts/` use a normal AWS profile through boto3 and are
 unaffected.
+
+### Production deploys
+
+`.github/workflows/deploy.yml` runs on every push to `main`: tests, `sam deploy`,
+then the frontend to Vercel. Neither deploy command exiting 0 counts as proof that
+the code runs, so each job then waits on the live service
+(`scripts/wait_for_http.sh`). The backend check expects a 401 from the Datadog
+webhook sent without its secret, which is the ingest function's own answer. The
+frontend check expects a 200 from `/api/incidents`, which reads DynamoDB through
+the OIDC role. Only after that does each job register a Datadog DORA deployment
+(`scripts/report_dora_deployment.sh`, RC1-459), as `incident-summarizer` and
+`incidents-hihelloreid`, which feeds deployment frequency and lead time with its
+PR-stage breakdown. The POST needs the `DD_API_KEY` repo secret and fails the
+job when it is rejected.
 
 ---
 
