@@ -16,8 +16,11 @@ The three LLM cases cover the shapes the pipeline actually produces:
   alert was a P1) while two later alert names contain the word "high". A
   model that reads severity off the alert names instead of the handed-over
   field re-decides it — exactly the violation the severity check exists for
-* **github-storm** — five distinct workflow failures on one repository, the
-  alert-count case
+* **alarm-storm** — five distinct CloudWatch alarms on one stack, the
+  alert-count case. It was `github-storm`, five workflow failures on one
+  repository, until RC1-458 retired the GitHub Actions source; CI failures now
+  arrive through one Datadog monitor under one service and alert name, which
+  dedup collapses rather than piles up, so that shape no longer occurs
 
 `fallback-path` reuses the storm incident but scores `_fallback_summary`
 deterministically — no model call, no key, no cost.
@@ -127,28 +130,28 @@ FIXTURES: tuple[Fixture, ...] = (
         ),
     ),
     Fixture(
-        id="github-storm",
-        affected_service="snacksnack/deploy-pipeline",
+        id="alarm-storm",
+        affected_service="orders-worker",
         alerts=tuple(
             Alert(
-                alert_id=f"gh-{i}",
-                source="github",
+                alert_id=f"cw-storm-{i}",
+                source="cloudwatch",
                 alert_name=name,
                 severity="high",
                 received_at=f"2026-08-12T11:{minute:02d}:00Z",
             )
             for i, (name, minute) in enumerate(
                 [
-                    ("CI", 2),
-                    ("Deploy to staging", 5),
-                    ("Integration tests", 9),
-                    ("Deploy to production", 14),
-                    ("Nightly build", 20),
+                    ("orders-worker-Errors", 2),
+                    ("orders-worker-Throttles", 5),
+                    ("orders-worker-Duration-p99", 9),
+                    ("orders-worker-DLQ-depth", 14),
+                    ("orders-worker-IteratorAge", 20),
                 ],
                 start=1,
             )
         ),
-        notes="Five distinct workflow failures in twenty minutes — the alert-count case.",
+        notes="Five distinct alarms on one stack in twenty minutes — the alert-count case.",
     ),
 )
 

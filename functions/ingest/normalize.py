@@ -20,22 +20,13 @@ _DD_RESOLVED_TRANSITIONS = {"Recovered"}
 # ("[Triggered on {service:x}] Error rate"); the fingerprint must not.
 _DD_TITLE_PREFIX = re.compile(r"^(\[[^\]]*\]\s*)+")
 
-# A run is an alert only once it has completed. in_progress / requested runs
-# (no conclusion yet), workflow_job and push events are ignored (RC1-373: every
-# deploy start used to open a HIGH incident because a missing conclusion
-# defaulted to "failure"). A successful run is a *recovery*: dedup closes the
-# open incident for that workflow if there is one, and drops it otherwise
-# (RC1-374).
-_GH_SUCCESS_CONCLUSIONS = {"success", "skipped", "neutral"}
-_GH_SEVERITY_MAP = {"failure": "high", "timed_out": "high", "startup_failure": "high", "cancelled": "medium"}
-
 
 def normalize(event: dict) -> NormalizedAlert | None:
     """The alert an inbound event describes, or None when it is not one.
 
-    None covers an unknown source, a payload that cannot be normalized (logged
-    and discarded, never raised: a malformed alert must not poison the
-    function) and a GitHub delivery that is not a completed workflow run.
+    None covers an unknown source and a payload that cannot be normalized
+    (logged and discarded, never raised: a malformed alert must not poison
+    the function).
     """
     source = _detect_source(event)
     if source is None:
@@ -45,9 +36,7 @@ def normalize(event: dict) -> NormalizedAlert | None:
     try:
         if source == "cloudwatch":
             return _normalize_cloudwatch(event)
-        if source == "datadog":
-            return _normalize_datadog(event)
-        return _normalize_github(event)
+        return _normalize_datadog(event)
     except Exception:
         logger.exception("Failed to normalize %s event, discarding", source)
         return None
@@ -57,7 +46,7 @@ def _detect_source(event: dict) -> str | None:
     src = event.get("source")
     if src == "aws.cloudwatch":
         return "cloudwatch"
-    if src in ("datadog", "github"):
+    if src == "datadog":
         return src
     return None
 
@@ -165,36 +154,4 @@ def _normalize_datadog(envelope: dict) -> NormalizedAlert:
         raw_payload=payload,
         received_at=envelope["received_at"],
         monitor_id=str(monitor_id) if monitor_id not in (None, "") else None,
-    )
-
-
-def _normalize_github(envelope: dict) -> NormalizedAlert | None:
-    payload = envelope["raw_payload"]
-    event_name = envelope.get("github_event") or ("workflow_run" if "workflow_run" in payload else "unknown")
-    action = payload.get("action")
-    if event_name != "workflow_run" or action != "completed":
-        logger.info("Ignoring github %s.%s event: only completed workflow runs are alerts", event_name, action)
-        return None
-
-    run = payload["workflow_run"]
-    conclusion = run.get("conclusion")
-    if not conclusion:
-        logger.warning("Ignoring completed github workflow run %r with no conclusion", run.get("name"))
-        return None
-
-    if conclusion in _GH_SUCCESS_CONCLUSIONS:
-        severity, status = "low", "resolved"
-    else:
-        # failure, timed_out, cancelled, startup_failure, action_required, stale, …
-        severity, status = _GH_SEVERITY_MAP.get(conclusion, "medium"), "open"
-
-    return NormalizedAlert(
-        alert_id=str(run["id"]),
-        source="github",
-        alert_name=run["name"],
-        affected_service=payload["repository"]["full_name"],
-        severity=severity,
-        status=status,
-        raw_payload=payload,
-        received_at=envelope["received_at"],
     )

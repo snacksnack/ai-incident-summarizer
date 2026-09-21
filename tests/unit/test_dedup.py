@@ -52,7 +52,7 @@ class TestGenerateFingerprint:
         assert all(c in "0123456789abcdef" for c in fp)
 
     def test_deterministic_across_invocations(self):
-        results = {generate_fingerprint("github", "CI", "org/repo") for _ in range(10)}
+        results = {generate_fingerprint("datadog", "CI pipeline failed", "delivery-pipeline") for _ in range(10)}
         assert len(results) == 1
 
 

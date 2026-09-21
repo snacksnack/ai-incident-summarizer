@@ -14,7 +14,15 @@ Built with AWS Lambda (Python), SAM, DynamoDB, Claude, Next.js, and Vercel.
 |---|---|---|
 | **CloudWatch** | Every alarm in the AWS account. The EventBridge rule matches `CloudWatch Alarm State Change` with no alarm-name filter, so an alarm feeds this pipeline the moment it exists; there is nothing to wire per alarm. Today that is the three `stale-ticket-bot-*` alarms, this stack's two own alarms and its self-test alarm (see below) | Native EventBridge |
 | **Datadog** | Synthetics uptime and TLS checks, CI Visibility (deploy and pipeline failures) and the LLM spend monitors; see `scripts/wire_datadog_monitors.py` for the exact set | Webhook via API Gateway |
-| **GitHub Actions** | CI/CD pipeline failures — only `workflow_run.completed` events; a failed run opens an incident, a successful one is a recovery that closes it; in-progress runs, `workflow_job` and `push` deliveries are ignored | Webhook via API Gateway |
+
+GitHub Actions was a third source, a repo webhook on `/webhook/github`, until
+RC1-458. Datadog CI Visibility already alerts on every failed run (monitor
+"CI pipeline failed — delivery repos", `service:delivery-pipeline`), and the
+two paths named the service differently, so dedup never merged them: one red
+Deploy run on 2026-09-13 filed INC-101 and INC-102 and opened two Slack
+threads. The Datadog path stays. What it gives up is the instant recovery: a
+green re-run used to close the incident at once, where the monitor recovers
+once its 15-minute window holds no failed run.
 
 **How the CloudWatch source is fed (RC1-435).** The rule is account-wide, so
 the set of alarms that can open an incident is `aws cloudwatch describe-alarms`,
@@ -45,7 +53,7 @@ defaulting to `high` in `ALARM` and `low` in `OK`.
 
 Two Lambda functions (RC1-431):
 
-- **Ingest** has two triggers: the HTTP API for the GitHub Actions and Datadog webhooks, and the EventBridge rule for CloudWatch alarm state changes. It authenticates the webhook (GitHub HMAC, Datadog shared-secret header), normalizes any source to one alert schema, suppresses duplicates by fingerprint, groups alerts for a service inside a 5-minute window into one incident (or, for a recovery, closes the matching open incident), writes the incident, and hands its ID to the summarizer with one asynchronous invoke.
+- **Ingest** has two triggers: the HTTP API for the Datadog webhook, and the EventBridge rule for CloudWatch alarm state changes. It authenticates the webhook (Datadog shared-secret header), normalizes any source to one alert schema, suppresses duplicates by fingerprint, groups alerts for a service inside a 5-minute window into one incident (or, for a recovery, closes the matching open incident), writes the incident, and hands its ID to the summarizer with one asynchronous invoke.
 - **Summarizer** reads the incident, asks Claude for a structured summary (or writes a deterministic fallback), then runs the delivery chain in order: Slack thread, Jira ticket, Datadog event. Each stage writes its artifact ID back to the incident and records the generation it delivered, so a retried invocation resumes where it stopped rather than posting again.
 
 State is DynamoDB: one TTL-gated alert-state table (`fp#` rows that suppress a repeated alert, `window#` rows that group a service's alerts for 5 minutes), the incident table, and a service registry the dashboard's filters read. The Next.js incident history UI on Vercel reads the incident table and registry directly. `docs/architecture.drawio` is the source of the diagram.
@@ -58,7 +66,7 @@ State is DynamoDB: one TTL-gated alert-state table (`fp#` rows that suppress a r
 | `source_alerts[]` | Per-alert summaries (id, source, name, severity, status, received_at; `monitor_id` for Datadog alerts) |
 | `affected_service` | Service name |
 | `severity` | critical / high / medium / low |
-| `status` | open / acknowledged / resolved — set to `resolved` by the recovery of an alert the incident holds (CloudWatch OK, Datadog Recovered, GitHub success) |
+| `status` | open / acknowledged / resolved — set to `resolved` by the recovery of an alert the incident holds (CloudWatch OK, Datadog Recovered) |
 | `resolved_at` | ISO timestamp of the recovery |
 | `recovery_summary` | LLM-generated closing note (same three fields as `llm_summary`) |
 | `llm_summary` | LLM-generated summary while open |
@@ -85,12 +93,11 @@ ai-incident-summarizer/
 ├── docs/                      # architecture.drawio + the exported PNG
 ├── events/                    # Sample payloads for `sam local invoke`
 │   ├── cloudwatch.json
-│   ├── datadog.json
-│   └── github-actions.json
+│   └── datadog.json
 ├── functions/
 │   ├── ingest/                # HTTP API + EventBridge → one incident hand-off
 │   │   ├── app.py             # routes by event shape; the async invoke of the summarizer
-│   │   ├── webhook.py         # GitHub HMAC / Datadog shared-secret validation
+│   │   ├── webhook.py         # Datadog shared-secret validation
 │   │   ├── normalize.py       # any source → the shared alert schema
 │   │   ├── dedup.py           # fingerprinting, time-window grouping, recovery close
 │   │   └── requirements.txt
@@ -131,7 +138,7 @@ Set by `template.yaml`; the SAM parameters in `samconfig.toml` supply the values
 
 | Variable | Function | Description |
 |---|---|---|
-| `GITHUB_WEBHOOK_SECRET_ARN`, `DATADOG_WEBHOOK_SECRET_ARN` | ingest | Secrets Manager ARNs for the webhook secrets |
+| `DATADOG_WEBHOOK_SECRET_ARN` | ingest | Secrets Manager ARN for the Datadog webhook secret |
 | `ALERT_STATE_TABLE_NAME`, `SERVICE_REGISTRY_TABLE_NAME` | ingest | The alert-state (fingerprint + window) and registry tables |
 | `CORRELATION_WINDOW_MINUTES` | ingest | Alert grouping window (5) |
 | `SUMMARIZER_FUNCTION_NAME` | ingest | The one async hand-off |
@@ -235,7 +242,6 @@ aws cloudformation describe-stacks --stack-name ai-incident-summarizer \
 
 | Source | Endpoint |
 |---|---|
-| GitHub Actions | `POST <WebhookApiUrl>/webhook/github` |
 | Datadog | `POST <WebhookApiUrl>/webhook/datadog` |
 
 `WebhookApiUrl` ends in the API stage (`/prod`). A URL without it returns `404 {"message":"Not Found"}` from API Gateway itself, with nothing in the receiver's logs — the symptom to look for when a webhook "sends but nothing arrives".
@@ -266,7 +272,7 @@ DD_API_KEY=… DD_APP_KEY=… python scripts/wire_datadog_monitors.py --dry-run 
 | Secret management | AWS Secrets Manager | API keys never stored in plain text or env vars |
 | Deployment | AWS SAM | Native AWS tooling, infrastructure-as-code |
 | Observability | Datadog Lambda layer (ddtrace) + Extension | APM traces, logs and metrics auto-instrumented; the Claude call also reports to LLM Observability as ml_app `incident-summarizer` with tokens and cost (RC1-419). Same ddtrace as the rest of the fleet, switched on by `DD_LLMOBS_*` env vars instead of an `LLMObs.enable()` call and flushed through the extension rather than agentless, which would add a blocking flush to every invocation (RC1-445) |
-| Recoveries | Close, never open | A resolved alert (CloudWatch OK, Datadog Recovered, GitHub success) closes the newest open incident for that service holding the same alert, retires the window and fingerprint rows so the next alert starts fresh, and runs the delivery chain once more with a `recovered` flag: Slack reply in the thread, Jira comment plus a Done-category transition when the workflow offers one, Datadog `success` event on the same aggregation key. A recovery with nothing to close is dropped. |
+| Recoveries | Close, never open | A resolved alert (CloudWatch OK, Datadog Recovered) closes the newest open incident for that service holding the same alert, retires the window and fingerprint rows so the next alert starts fresh, and runs the delivery chain once more with a `recovered` flag: Slack reply in the thread, Jira comment plus a Done-category transition when the workflow offers one, Datadog `success` event on the same aggregation key. A recovery with nothing to close is dropped. |
 | Delivery chain | Slack → Jira → Datadog, in one function | The order is a sequencing constraint (the Datadog event carries both links), not a reason for three functions. Each stage is idempotent about its own artifact and records `<stage>_delivered_count`, so a Lambda retry of the summarizer resumes at the first unfinished stage instead of re-posting; a re-summary of a live incident (a new alert in the window) is a new generation and delivers again. |
 | Datadog write-back | Events API v1, last stop in the delivery chain | The summary that came out of Datadog's alerts goes back in as an event, so the timeline shows it beside the raw monitors; `aggregation_key` rolls re-summaries and the recovery up under one row. Reuses the Lambda extension's API key secret — Datadog API keys carry no scopes, so there is no narrower key to mint. |
 | Incident history UI | Next.js on Vercel | Next.js API routes call DynamoDB directly as Vercel serverless functions — no API Gateway needed. A single `vercel deploy` produces a shareable URL. React handles the dashboard UI. Chosen over a static S3 + API Gateway approach for simplicity and to gain practical exposure to Vercel, which is widely used in the industry. |
@@ -277,7 +283,7 @@ DD_API_KEY=… DD_APP_KEY=… python scripts/wire_datadog_monitors.py --dry-run 
 
 
 **Datadog webhook signature verification**
-Datadog's webhook integration does not support HMAC payload signing natively, unlike GitHub Actions which uses `X-Hub-Signature-256`. Instead, a shared secret is passed via a custom `X-Webhook-Secret` header configured in the Datadog webhook settings and stored in AWS Secrets Manager. The receiver validates the header value using a timing-safe comparison. This is Datadog's recommended approach for webhook authentication.
+Datadog's webhook integration does not support HMAC payload signing natively. Instead, a shared secret is passed via a custom `X-Webhook-Secret` header configured in the Datadog webhook settings and stored in AWS Secrets Manager. The receiver validates the header value using a timing-safe comparison. This is Datadog's recommended approach for webhook authentication.
 
 ---
 

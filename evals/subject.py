@@ -75,7 +75,7 @@ CASES: tuple[Case, ...] = tuple(
 ) + (
     Case(
         id="fallback-path",
-        input={"fixture": "github-storm"},
+        input={"fixture": "alarm-storm"},
         expect=("returns-the-contracted-json", "states-the-facts"),
         tags=("incident-summary", "fallback", "deterministic"),
     ),

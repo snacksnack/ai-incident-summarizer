@@ -53,7 +53,6 @@ def _dd_webhook(payload: dict) -> dict:
 @pytest.fixture()
 def ingest(monkeypatch):
     monkeypatch.setenv("SUMMARIZER_FUNCTION_NAME", SUMMARIZER_FUNCTION)
-    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET_ARN", "arn:github")
     monkeypatch.setenv("DATADOG_WEBHOOK_SECRET_ARN", DATADOG_SECRET_ARN)
     aws.reset()
     mock_secrets = MagicMock()

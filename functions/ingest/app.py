@@ -1,8 +1,7 @@
 """Ingest: every alert source in, one incident hand-off out (RC1-431).
 
-Two triggers reach this handler. API Gateway delivers the GitHub Actions and
-Datadog webhooks; EventBridge delivers CloudWatch alarm state changes as
-native events. Both are authenticated or trusted at the edge, normalized to
+Two triggers reach this handler. API Gateway delivers the Datadog webhook;
+EventBridge delivers CloudWatch alarm state changes as native events. Both are authenticated or trusted at the edge, normalized to
 the shared alert schema, deduplicated and grouped into an incident, and the
 incident is handed to the summarizer with one asynchronous invoke.
 

@@ -6,9 +6,9 @@ comments, read them before changing anything in `Globals`.
 
 ## What this is
 
-An alert pipeline on AWS Lambda, deployed with SAM. CloudWatch, Datadog and
-GitHub Actions alerts arrive at API Gateway or EventBridge, are normalised to
-one schema, deduplicated and grouped into an incident, summarised by Claude,
+An alert pipeline on AWS Lambda, deployed with SAM. CloudWatch and Datadog
+alerts arrive at EventBridge or API Gateway, are normalised to one schema,
+deduplicated and grouped into an incident, summarised by Claude,
 then delivered to Slack, Jira and the Datadog event timeline. A Next.js
 incident history UI on Vercel reads DynamoDB directly.
 
@@ -18,7 +18,7 @@ incident history UI on Vercel reads DynamoDB directly.
 template.yaml         SAM: two functions, tables, API, the Globals block
 functions/ingest/     HTTP API + EventBridge in, one async invoke out
   app.py              routes by event shape
-  webhook.py          HMAC / shared-secret validation at the edge
+  webhook.py          Datadog shared-secret validation at the edge
   normalize.py        any source -> the shared alert schema
   dedup.py            fingerprint, time-window grouping, recovery close
 functions/summarizer/
