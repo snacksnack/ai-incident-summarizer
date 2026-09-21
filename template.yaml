@@ -3,9 +3,6 @@ Transform: AWS::Serverless-2016-10-31
 Description: AI-powered incident alert summarizer
 
 Parameters:
-  GithubWebhookSecretArn:
-    Type: String
-    Description: Secrets Manager ARN for the GitHub webhook signing secret
   DatadogWebhookSecretArn:
     Type: String
     Description: Secrets Manager ARN for the Datadog X-Webhook-Secret shared header value
@@ -143,19 +140,23 @@ Resources:
       CompatibleRuntimes:
         - python3.14
 
-  # ── Ingest: webhooks (Datadog + GitHub Actions) and CloudWatch via EventBridge ──
+  # ── Ingest: the Datadog webhook and CloudWatch via EventBridge ──────────────
   #
   # One function for everything alert-shaped (RC1-431). It used to be three
   # (webhook receiver → normalizer → dedup) joined by async invokes; they
   # shared no failure domain worth isolating, and the whole path is a few
   # DynamoDB writes, well inside API Gateway's 29 s cap. The EventBridge rule
-  # and the two HTTP routes all target this function.
+  # and the HTTP route both target this function.
+  #
+  # There is no GitHub Actions route (RC1-458). Datadog CI Visibility already
+  # alerts on failed runs under service:delivery-pipeline, and a second path
+  # under the repo name filed every red run twice.
 
   WebhookApi:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: prod
-      Description: Receives inbound webhooks from Datadog and GitHub Actions and hands them to the ingest function
+      Description: Receives the inbound Datadog webhook and hands it to the ingest function
 
   IngestFunction:
     Type: AWS::Serverless::Function
@@ -168,7 +169,6 @@ Resources:
         - !Sub arn:aws:lambda:${AWS::Region}:464622532012:layer:Datadog-Extension:99
       Environment:
         Variables:
-          GITHUB_WEBHOOK_SECRET_ARN: !Ref GithubWebhookSecretArn
           DATADOG_WEBHOOK_SECRET_ARN: !Ref DatadogWebhookSecretArn
           ALERT_STATE_TABLE_NAME: !Ref AlertStateTable
           INCIDENT_TABLE_NAME: !Ref IncidentTable
@@ -186,7 +186,6 @@ Resources:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
               Resource:
-                - !Ref GithubWebhookSecretArn
                 - !Ref DatadogWebhookSecretArn
                 - !Ref DatadogApiKeySecretArn
         - Statement:
@@ -194,12 +193,6 @@ Resources:
               Action: lambda:InvokeFunction
               Resource: !GetAtt SummarizerFunction.Arn
       Events:
-        GithubWebhook:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref WebhookApi
-            Path: /webhook/github
-            Method: POST
         DatadogWebhook:
           Type: HttpApi
           Properties:
@@ -542,7 +535,7 @@ Outputs:
   WebhookApiUrl:
     # The HTTP API's only stage is `prod`, and a named stage is part of the
     # invoke URL. Without it every call 404s at API Gateway before the receiver
-    # runs — which is where both the Datadog and GitHub webhooks pointed until
+    # runs — which is where the Datadog webhook (and the since-retired GitHub one) pointed until
     # RC1-370.
     Description: Base URL for the webhook API endpoint (includes the stage)
     Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${WebhookApiprodStage}"

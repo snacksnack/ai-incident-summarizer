@@ -67,26 +67,6 @@ def _dd_envelope(priority="P1", transition="Triggered", tags=None, alert_type="e
     }
 
 
-def _gh_envelope(conclusion="failure", workflow_name="CI", repo="org/repo", action="completed", event="workflow_run"):
-    return {
-        "source": "github",
-        "received_at": "2024-01-15T10:30:00+00:00",
-        "path": "/webhook/github",
-        "github_event": event,
-        "raw_payload": {
-            "action": action,
-            "workflow_run": {
-                "id": 1234567890,
-                "name": workflow_name,
-                "head_branch": "main",
-                "conclusion": conclusion,
-                "status": "completed",
-            },
-            "repository": {"full_name": repo, "name": repo.split("/")[-1]},
-        },
-    }
-
-
 # ── CloudWatch tests ──────────────────────────────────────────────────────────
 
 class TestCloudWatch:
@@ -234,110 +214,6 @@ class TestDatadog:
         assert _run(normalizer, env)["status"] == "open"
 
 
-# ── GitHub Actions tests ──────────────────────────────────────────────────────
-
-class TestGitHub:
-    def test_failure_returns_open_high(self, normalizer):
-        result = _run(normalizer, _gh_envelope(conclusion="failure"))
-        assert result["status"] == "open"
-        assert result["severity"] == "high"
-        assert result["source"] == "github"
-
-    def test_timed_out_returns_open_high(self, normalizer):
-        result = _run(normalizer, _gh_envelope(conclusion="timed_out"))
-        assert result["status"] == "open"
-        assert result["severity"] == "high"
-
-    def test_cancelled_returns_open_medium(self, normalizer):
-        result = _run(normalizer, _gh_envelope(conclusion="cancelled"))
-        assert result["status"] == "open"
-        assert result["severity"] == "medium"
-
-    def test_startup_failure_returns_open_high(self, normalizer):
-        result = _run(normalizer, _gh_envelope(conclusion="startup_failure"))
-        assert result["status"] == "open"
-        assert result["severity"] == "high"
-
-    def test_unknown_non_success_conclusion_returns_open_medium(self, normalizer):
-        result = _run(normalizer, _gh_envelope(conclusion="action_required"))
-        assert result["status"] == "open"
-        assert result["severity"] == "medium"
-
-    # RC1-373: only completed workflow runs are alerts. RC1-374: a successful
-    # one is a recovery (status resolved) that dedup closes an incident with.
-    def test_success_is_a_recovery(self, normalizer):
-        result = _run(normalizer, _gh_envelope(conclusion="success"))
-        assert result["status"] == "resolved"
-        assert result["severity"] == "low"
-        assert result["alert_name"] == "CI"
-
-    def test_skipped_and_neutral_are_recoveries(self, normalizer):
-        assert _run(normalizer, _gh_envelope(conclusion="skipped"))["status"] == "resolved"
-        assert _run(normalizer, _gh_envelope(conclusion="neutral"))["status"] == "resolved"
-
-    def test_in_progress_run_is_ignored_without_error(self, normalizer, caplog):
-        env = _gh_envelope(action="in_progress")
-        env["raw_payload"]["workflow_run"]["conclusion"] = None
-        env["raw_payload"]["workflow_run"]["status"] = "in_progress"
-        with caplog.at_level("INFO"):
-            assert _run(normalizer, env) is None
-        assert "ERROR" not in caplog.text
-        assert "Ignoring github workflow_run.in_progress" in caplog.text
-
-    def test_requested_run_is_ignored(self, normalizer):
-        assert _run(normalizer, _gh_envelope(action="requested")) is None
-
-    def test_workflow_job_event_is_ignored_without_error(self, normalizer, caplog):
-        env = {
-            "source": "github",
-            "received_at": "2024-01-15T10:30:00+00:00",
-            "path": "/webhook/github",
-            "github_event": "workflow_job",
-            "raw_payload": {"action": "completed", "workflow_job": {"id": 1, "conclusion": "success"},
-                            "repository": {"full_name": "org/repo"}},
-        }
-        with caplog.at_level("INFO"):
-            assert _run(normalizer, env) is None
-        assert "ERROR" not in caplog.text
-
-    def test_push_event_is_ignored(self, normalizer):
-        env = {
-            "source": "github",
-            "received_at": "2024-01-15T10:30:00+00:00",
-            "path": "/webhook/github",
-            "github_event": "push",
-            "raw_payload": {"ref": "refs/heads/main", "commits": [], "repository": {"full_name": "org/repo"}},
-        }
-        assert _run(normalizer, env) is None
-
-    def test_completed_run_without_conclusion_is_ignored(self, normalizer):
-        env = _gh_envelope()
-        env["raw_payload"]["workflow_run"]["conclusion"] = None
-        assert _run(normalizer, env) is None
-
-    def test_missing_event_header_falls_back_to_payload_shape(self, normalizer):
-        env = _gh_envelope(conclusion="failure")
-        del env["github_event"]
-        assert _run(normalizer, env)["status"] == "open"
-
-    def test_missing_event_header_and_no_workflow_run_is_ignored(self, normalizer):
-        env = {"source": "github", "received_at": "2024-01-15T10:30:00+00:00", "path": "/webhook/github",
-               "raw_payload": {"action": "completed", "workflow_job": {}}}
-        assert _run(normalizer, env) is None
-
-    def test_affected_service_is_repo_full_name(self, normalizer):
-        result = _run(normalizer, _gh_envelope(repo="acme/payments-api"))
-        assert result["affected_service"] == "acme/payments-api"
-
-    def test_alert_name_is_workflow_name(self, normalizer):
-        result = _run(normalizer, _gh_envelope(workflow_name="Deploy to Production"))
-        assert result["alert_name"] == "Deploy to Production"
-
-    def test_alert_id_from_run_id(self, normalizer):
-        result = _run(normalizer, _gh_envelope())
-        assert result["alert_id"] == "1234567890"
-
-
 # ── Unknown source ────────────────────────────────────────────────────────────
 
 class TestUnknownSource:
@@ -348,6 +224,12 @@ class TestUnknownSource:
     def test_missing_source_returns_none(self, normalizer):
         result = _run(normalizer, {"data": "some payload"})
         assert result is None
+
+    def test_retired_github_source_returns_none(self, normalizer):
+        """RC1-458: GitHub Actions alerts arrive through Datadog CI Visibility now."""
+        env = {"source": "github", "received_at": "2024-01-15T10:30:00+00:00",
+               "raw_payload": {"action": "completed", "workflow_run": {"conclusion": "failure"}}}
+        assert _run(normalizer, env) is None
 
 
 # ── CloudWatch service naming (RC1-437) ──────────────────────────────────────

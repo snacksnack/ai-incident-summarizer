@@ -5,7 +5,7 @@ from typing import Literal
 @dataclass
 class NormalizedAlert:
     alert_id: str
-    source: Literal["cloudwatch", "datadog", "github"]
+    source: Literal["cloudwatch", "datadog"]
     alert_name: str
     affected_service: str
     severity: Literal["critical", "high", "medium", "low"]

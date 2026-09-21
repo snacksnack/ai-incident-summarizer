@@ -96,12 +96,12 @@ class TestFixturesMirrorDedup:
 
 class TestFallback:
     def test_fallback_meets_the_contract(self):
-        fixture = fixtures.BY_ID["github-storm"]
+        fixture = fixtures.BY_ID["alarm-storm"]
         fallback = summarizer.fallback(fixture.incident())
         assert set(fallback) == {"summary", "likely_cause", "next_step"}
 
     def test_fallback_states_service_and_count(self):
-        fixture = fixtures.BY_ID["github-storm"]
+        fixture = fixtures.BY_ID["alarm-storm"]
         fallback = summarizer.fallback(fixture.incident())
         assert fixture.affected_service in fallback["summary"]
         assert str(fixture.alert_count) in fallback["summary"]

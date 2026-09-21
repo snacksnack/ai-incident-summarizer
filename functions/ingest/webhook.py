@@ -1,12 +1,14 @@
-"""Authentication of the inbound webhooks (GitHub Actions, Datadog) and the
-envelope the normalizer reads from them.
+"""Authentication of the inbound Datadog webhook and the envelope the
+normalizer reads from it.
 
-GitHub signs the body with HMAC-SHA256 (`X-Hub-Signature-256`). Datadog's
-webhook integration cannot sign, so a shared secret travels in a custom
-`X-Webhook-Secret` header and is compared timing-safely.
+Datadog's webhook integration cannot sign, so a shared secret travels in a
+custom `X-Webhook-Secret` header and is compared timing-safely.
+
+GitHub Actions was a second webhook source until RC1-458. Datadog CI
+Visibility already alerted on the same failures under another service name,
+so every red run was filed twice (INC-101 / INC-102).
 """
 import base64
-import hashlib
 import hmac
 import json
 import logging
@@ -17,7 +19,6 @@ from common import aws
 
 logger = logging.getLogger()
 
-GITHUB_PATH = "/webhook/github"
 DATADOG_PATH = "/webhook/datadog"
 
 
@@ -42,41 +43,30 @@ def parse(event: dict) -> dict:
     """Authenticate an API Gateway event and return the source envelope.
 
     Raises `Rejected` with the status to return: 401 on a bad signature or
-    secret, 404 off the two routes, 400 when the body is not JSON.
+    secret, 404 off the route, 400 when the body is not JSON.
     """
     path = route_path(event)
-    body_raw, body_bytes = extract_body(event)
+    body_raw = extract_body(event)
     headers = event.get("headers") or {}
 
-    if path == GITHUB_PATH:
-        secret = shared_secret(os.environ["GITHUB_WEBHOOK_SECRET_ARN"])
-        if not verify_github(headers.get("x-hub-signature-256", ""), body_bytes, secret):
-            raise Rejected(401, "Unauthorized")
-    elif path == DATADOG_PATH:
-        secret = shared_secret(os.environ["DATADOG_WEBHOOK_SECRET_ARN"])
-        if not verify_datadog_header(headers.get("x-webhook-secret", ""), secret):
-            raise Rejected(401, "Unauthorized")
-    else:
+    if path != DATADOG_PATH:
         logger.warning("Rejected webhook for unknown path %r (rawPath=%r)", path, event.get("rawPath"))
         raise Rejected(404, "Not Found")
+    secret = shared_secret(os.environ["DATADOG_WEBHOOK_SECRET_ARN"])
+    if not verify_datadog_header(headers.get("x-webhook-secret", ""), secret):
+        raise Rejected(401, "Unauthorized")
 
     try:
         raw_payload = json.loads(body_raw)
     except (ValueError, TypeError):
         raise Rejected(400, "Bad Request")
 
-    source = "github" if path == GITHUB_PATH else "datadog"
-    envelope = {
-        "source": source,
+    return {
+        "source": "datadog",
         "raw_payload": raw_payload,
         "received_at": datetime.now(timezone.utc).isoformat(),
         "path": path,
     }
-    if source == "github":
-        # GitHub names the event only in this header; the body of a
-        # workflow_job or push event has no workflow_run key to tell them apart.
-        envelope["github_event"] = headers.get("x-github-event")
-    return envelope
 
 
 def route_path(event: dict) -> str:
@@ -98,24 +88,11 @@ def route_path(event: dict) -> str:
     return path
 
 
-def extract_body(event: dict) -> tuple[str, bytes]:
+def extract_body(event: dict) -> str:
     body = event.get("body") or ""
     if event.get("isBase64Encoded"):
-        body_bytes = base64.b64decode(body)
-        body_str = body_bytes.decode("utf-8")
-    else:
-        body_str = body
-        body_bytes = body_str.encode("utf-8")
-    return body_str, body_bytes
-
-
-def verify_github(header_value: str, body_bytes: bytes, secret: str) -> bool:
-    if not header_value.startswith("sha256="):
-        return False
-    expected = "sha256=" + hmac.new(
-        secret.encode("utf-8"), body_bytes, hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected, header_value)
+        return base64.b64decode(body).decode("utf-8")
+    return body
 
 
 def verify_datadog_header(header_value: str, secret: str) -> bool:
@@ -131,9 +108,8 @@ def shared_secret(arn: str) -> str:
 def secret_value(secret_string: str) -> str:
     """The shared secret itself, whichever way Secrets Manager holds it.
 
-    Both webhook secrets were created as key/value pairs, so the stored string
-    is '{"gh-webhook-secret": "<hex>"}', while GitHub signs with, and Datadog
-    sends, the bare <hex>. Comparing against the JSON text rejected every
+    The webhook secret was created as a key/value pair, so the stored string
+    is '{"<secret-name>": "<hex>"}', while Datadog sends the bare <hex>. Comparing against the JSON text rejected every
     real webhook with a 401 (RC1-370). A one-key JSON object yields its value;
     anything else is used as-is.
     """
