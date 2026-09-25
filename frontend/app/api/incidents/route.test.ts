@@ -93,14 +93,37 @@ describe("GET /api/incidents", () => {
     expect(new Set(queryInputs().map((i) => i.IndexName))).toEqual(new Set(["status-created-index"]));
   });
 
-  it("defaults to open on the status index when nothing is given", async () => {
+  it("defaults to all statuses when nothing is given", async () => {
     ddb.on(QueryCommand).resolves({ Items: [] });
 
     await get("");
 
-    expect(queryInputs()).toHaveLength(1);
-    expect(queryInputs()[0].IndexName).toBe("status-created-index");
-    expect(queryInputs()[0].ExpressionAttributeValues).toEqual({ ":s": "open" });
+    expect(queryInputs()).toHaveLength(3);
+    expect(new Set(queryInputs().map((i) => i.IndexName))).toEqual(new Set(["status-created-index"]));
+    expect(queryInputs().map((i) => i.ExpressionAttributeValues?.[":s"])).toEqual([
+      "open",
+      "acknowledged",
+      "resolved",
+    ]);
+  });
+
+  it("follows LastEvaluatedKey until the query is exhausted", async () => {
+    const lastKey = { incident_id: "INC-page-1" };
+    ddb.on(QueryCommand).callsFake((input: { ExclusiveStartKey?: Record<string, unknown> }) =>
+      input.ExclusiveStartKey
+        ? { Items: [incident({ incident_id: "INC-2", created_at: "2026-09-13T10:00:00+00:00" })] }
+        : {
+            Items: [incident({ incident_id: "INC-1", created_at: "2026-09-14T10:00:00+00:00" })],
+            LastEvaluatedKey: lastKey,
+          }
+    );
+
+    const res = await get("?status=open");
+
+    const ids = ((await res.json()) as Incident[]).map((i) => i.incident_id);
+    expect(ids).toEqual(["INC-1", "INC-2"]);
+    expect(queryInputs()).toHaveLength(2);
+    expect(queryInputs()[1].ExclusiveStartKey).toEqual(lastKey);
   });
 
   it("rejects an unrecognised status with 400 before touching DynamoDB", async () => {

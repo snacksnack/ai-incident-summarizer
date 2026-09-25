@@ -37,7 +37,9 @@ function summarySnippet(incident: Incident): string {
 type IncidentResult = { key: string; incidents: Incident[]; error: string | null };
 
 export default function IncidentListPage() {
-  const [status, setStatus] = useState("open");
+  // "all" mirrors the API default: the landing view is recent history, not an
+  // open-only list that sits empty (or stale) whenever nothing is broken.
+  const [status, setStatus] = useState(ALL_STATUSES);
   const [query, setQuery] = useState("");
   const [picked, setPicked] = useState<string | null>(null);
   const [services, setServices] = useState<string[] | null>(null);
