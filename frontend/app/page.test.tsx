@@ -84,7 +84,7 @@ describe("service typeahead", () => {
     const tags = screen.getAllByRole("button").map((b) => b.textContent);
     expect(tags).toEqual(["payments-service"]);
     // A partial match narrows the tags; it is not a filter on the incidents.
-    expect(incidentUrls(fetchMock)).toEqual(["/api/incidents?status=open"]);
+    expect(incidentUrls(fetchMock)).toEqual(["/api/incidents?status=all"]);
   });
 
   it("selects the service when the full name is typed in any case", async () => {
@@ -98,7 +98,7 @@ describe("service typeahead", () => {
       "true"
     );
     expect(incidentUrls(fetchMock).at(-1)).toBe(
-      "/api/incidents?status=open&service=payments-service"
+      "/api/incidents?status=all&service=payments-service"
     );
   });
 
@@ -128,7 +128,7 @@ describe("tag toggle and search-box sync", () => {
       "aria-pressed",
       "true"
     );
-    expect(incidentUrls(fetchMock).at(-1)).toBe("/api/incidents?status=open&service=auth-service");
+    expect(incidentUrls(fetchMock).at(-1)).toBe("/api/incidents?status=all&service=auth-service");
   });
 
   it("clicking the active tag clears both controls", async () => {
@@ -143,7 +143,7 @@ describe("tag toggle and search-box sync", () => {
       "aria-pressed",
       "false"
     );
-    expect(incidentUrls(fetchMock).at(-1)).toBe("/api/incidents?status=open");
+    expect(incidentUrls(fetchMock).at(-1)).toBe("/api/incidents?status=all");
   });
 
   it("typing after a click clears the previous selection", async () => {
@@ -157,7 +157,7 @@ describe("tag toggle and search-box sync", () => {
     // the two controls cannot disagree about which one is.
     expect(screen.getByLabelText("Service")).toHaveValue("auth-servicex");
     expect(screen.queryByRole("button", { pressed: true })).not.toBeInTheDocument();
-    expect(incidentUrls(fetchMock).at(-1)).toBe("/api/incidents?status=open");
+    expect(incidentUrls(fetchMock).at(-1)).toBe("/api/incidents?status=all");
   });
 });
 
@@ -165,11 +165,11 @@ describe("stale responses", () => {
   it("never renders an older result set over a newer one", async () => {
     const { incidentRequests } = stubFetch([], true);
     const user = await renderPage();
-    expect(incidentRequests.map((r) => r.url)).toEqual(["/api/incidents?status=open"]);
+    expect(incidentRequests.map((r) => r.url)).toEqual(["/api/incidents?status=all"]);
 
     await user.selectOptions(screen.getByLabelText("Status"), "resolved");
     expect(incidentRequests.map((r) => r.url)).toEqual([
-      "/api/incidents?status=open",
+      "/api/incidents?status=all",
       "/api/incidents?status=resolved",
     ]);
 
