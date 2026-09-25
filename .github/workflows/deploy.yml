@@ -17,6 +17,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
+      actions: read   # close_dora_failures.sh lists this workflow's own runs (RC1-464)
 
     steps:
       - uses: actions/checkout@v4
@@ -57,19 +58,37 @@ jobs:
       # without its secret. That proves the new code imports, reads Secrets
       # Manager and answers. API Gateway alone would say 404 or 5xx.
       - name: Gate on the ingest function answering
+        id: ingest_gate
         run: |
           url=$(aws cloudformation describe-stacks --stack-name ai-incident-summarizer \
             --query "Stacks[0].Outputs[?OutputKey=='WebhookApiUrl'].OutputValue" --output text)
           scripts/wait_for_http.sh POST "$url/webhook/datadog" 401
+
+      # A failed gate is a change failure — deployed but not serving (RC1-464).
+      # Only the gate: a sam deploy failure ships nothing.
+      - name: Report change failure to Datadog DORA
+        if: failure() && steps.ingest_gate.outcome == 'failure'
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+        run: scripts/report_dora_failure.sh incident-summarizer
 
       - name: Report deploy to Datadog DORA
         env:
           DD_API_KEY: ${{ secrets.DD_API_KEY }}
         run: scripts/report_dora_deployment.sh incident-summarizer "$DEPLOY_STARTED_AT"
 
+      - name: Close restored DORA change failures
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/close_dora_failures.sh incident-summarizer deploy.yml "Gate on the ingest function answering"
+
   deploy-frontend:
     runs-on: ubuntu-latest
     needs: test-and-deploy
+    permissions:
+      contents: read
+      actions: read   # close_dora_failures.sh lists this workflow's own runs (RC1-464)
 
     steps:
       - uses: actions/checkout@v4
@@ -92,9 +111,25 @@ jobs:
       # /api/incidents assumes DashboardReadRole via Vercel OIDC and reads
       # DynamoDB, so a 200 there is the whole read path, not just a static page.
       - name: Gate on the dashboard serving incidents
+        id: dashboard_gate
         run: scripts/wait_for_http.sh GET https://incidents.hihelloreid.com/api/incidents 200
+
+      # Same contract as the backend job, for the dashboard's own service
+      # (RC1-464): a failed gate after a green Vercel deploy is a change
+      # failure for incidents-hihelloreid.
+      - name: Report change failure to Datadog DORA
+        if: failure() && steps.dashboard_gate.outcome == 'failure'
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+        run: scripts/report_dora_failure.sh incidents-hihelloreid
 
       - name: Report deploy to Datadog DORA
         env:
           DD_API_KEY: ${{ secrets.DD_API_KEY }}
         run: scripts/report_dora_deployment.sh incidents-hihelloreid "$DEPLOY_STARTED_AT"
+
+      - name: Close restored DORA change failures
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/close_dora_failures.sh incidents-hihelloreid deploy.yml "Gate on the dashboard serving incidents"
