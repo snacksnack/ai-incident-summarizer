@@ -30,8 +30,17 @@ jobs:
       - name: Install test dependencies
         run: pip install -r tests/requirements-test.txt
 
+      # RC1-452: --ddtrace reports test-level results to Test Optimization,
+      # agentless. Not a test credential: the suite passes identically with
+      # no key (the plugin logs an error and runs everything untouched).
       - name: Run tests
-        run: python -m pytest tests/ -v
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_CIVISIBILITY_AGENTLESS_ENABLED: "true"
+          DD_SITE: datadoghq.com
+          DD_SERVICE: ai-incident-summarizer
+          DD_ENV: ci
+        run: python -m pytest tests/ -v --ddtrace
 
       - name: Validate SAM template
         # sam validate does not call AWS — dummy credentials satisfy the SDK
@@ -70,5 +79,14 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # RC1-452: vitest needs both the ESM loader hooks and the CI-mode
+      # tracer init; register.js alone silently reports nothing.
       - name: Unit tests
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_CIVISIBILITY_AGENTLESS_ENABLED: "true"
+          DD_SITE: datadoghq.com
+          DD_SERVICE: ai-incident-summarizer
+          DD_ENV: ci
+          NODE_OPTIONS: "--import dd-trace/register.js -r dd-trace/ci/init"
         run: npm test
