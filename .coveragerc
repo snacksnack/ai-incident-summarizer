@@ -1,0 +1,8 @@
+# RC1-468: coverage measures what deploys — the Lambda source and the shared
+# layer. Matching by directory, because both functions ship a module named
+# `app` (tests/conftest.py juggles sys.path to import each fresh, the way
+# Lambda's /var/task does), so package names would be ambiguous.
+[run]
+source =
+    functions
+    layers
