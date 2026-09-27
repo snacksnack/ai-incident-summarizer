@@ -50,7 +50,9 @@ secrets.json
 
 # Test coverage
 .coverage
+.coverage.*
 htmlcov/
+coverage/
 .pytest_cache/
 .tox/
 

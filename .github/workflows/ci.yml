@@ -33,6 +33,9 @@ jobs:
       # RC1-452: --ddtrace reports test-level results to Test Optimization,
       # agentless. Not a test credential: the suite passes identically with
       # no key (the plugin logs an error and runs everything untouched).
+      # RC1-468: --cov adds line coverage (source = functions/ + layers/,
+      # .coveragerc); ddtrace reports it as test.code_coverage.lines_pct.
+      # Coverage is a signal, not a gate — no threshold fails this step.
       - name: Run tests
         env:
           DD_API_KEY: ${{ secrets.DD_API_KEY }}
@@ -40,7 +43,7 @@ jobs:
           DD_SITE: datadoghq.com
           DD_SERVICE: ai-incident-summarizer
           DD_ENV: ci
-        run: python -m pytest tests/ -v --ddtrace
+        run: python -m pytest tests/ -v --ddtrace --cov
 
       - name: Validate SAM template
         # sam validate does not call AWS — dummy credentials satisfy the SDK
@@ -81,6 +84,8 @@ jobs:
 
       # RC1-452: vitest needs both the ESM loader hooks and the CI-mode
       # tracer init; register.js alone silently reports nothing.
+      # RC1-468: --coverage (V8) reports test.code_coverage.lines_pct.
+      # Signal, not a gate — no threshold fails the step.
       - name: Unit tests
         env:
           DD_API_KEY: ${{ secrets.DD_API_KEY }}
@@ -89,4 +94,4 @@ jobs:
           DD_SERVICE: ai-incident-summarizer
           DD_ENV: ci
           NODE_OPTIONS: "--import dd-trace/register.js -r dd-trace/ci/init"
-        run: npm test
+        run: npm test -- --coverage

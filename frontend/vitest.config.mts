@@ -17,5 +17,12 @@ export default defineConfig({
     include: ["**/*.test.{ts,tsx}"],
     exclude: ["node_modules/**", ".next/**"],
     restoreMocks: true,
+    // RC1-468: line coverage over the page and route source; CI passes
+    // --coverage, local `npm test` stays uninstrumented. Signal, not a
+    // gate — no thresholds.
+    coverage: {
+      provider: "v8",
+      include: ["app/**/*.{ts,tsx}", "lib/**/*.{ts,tsx}"],
+    },
   },
 });
