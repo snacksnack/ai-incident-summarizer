@@ -1,5 +1,10 @@
 name: CI
 
+# CI only reads the repo; the default GITHUB_TOKEN write scopes are unused
+# (CodeQL actions/missing-workflow-permissions, RC1-470).
+permissions:
+  contents: read
+
 on:
   pull_request:
     branches: [main]
