@@ -133,3 +133,20 @@ jobs:
           DD_API_KEY: ${{ secrets.DD_API_KEY }}
           GH_TOKEN: ${{ github.token }}
         run: scripts/close_dora_failures.sh incidents-hihelloreid deploy.yml "Gate on the dashboard serving incidents"
+
+  # Announce the deploy in #releases (RC1-497). Runs only after everything
+  # above passed, and never fails the run: the logic and that guarantee live
+  # in tpm-automation-platform's release-notify.yml.
+  release-notify:
+    name: Announce release
+    needs: [test-and-deploy, deploy-frontend]
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    uses: snacksnack/tpm-automation-platform/.github/workflows/release-notify.yml@main
+    with:
+      service: incident-summarizer
+      workflow: deploy.yml
+    secrets:
+      SLACK_RELEASES_WEBHOOK_URL: ${{ secrets.SLACK_RELEASES_WEBHOOK_URL }}
